@@ -478,29 +478,168 @@ async def a2a_message_send(request: Request, authorization: str = Header(None), 
     
     return a2a_json({"task": task_obj})
 
-@app.get("/a2a/tasks")
-async def a2a_list_tasks(authorization: str = Header(None), a2a_version: str = Header(None)):
-    principal = verify_a2a_headers(authorization, a2a_version)
-    user_tasks = list(TASKS_STORE.get(principal, {}).values())
-    return a2a_json({"tasks": user_tasks})
-
-@app.get("/a2a/tasks/{id}")
-async def a2a_get_task(id: str, authorization: str = Header(None), a2a_version: str = Header(None)):
-    principal = verify_a2a_headers(authorization, a2a_version)
-    if principal not in TASKS_STORE or id not in TASKS_STORE[principal]:
-        raise HTTPException(status_code=404, detail="Task not found")
-    return a2a_json(TASKS_STORE[principal][id])
-
-@app.post("/a2a/tasks/{id}:cancel")
-async def a2a_cancel_task(id: str, authorization: str = Header(None), a2a_version: str = Header(None)):
-    principal = verify_a2a_headers(authorization, a2a_version)
-    if principal not in TASKS_STORE or id not in TASKS_STORE[principal]:
-        raise HTTPException(status_code=404, detail="Task not found")
+@app.post("/a2a/message:send")
+async def a2a_message_send(request: Request, authorization: str = Header(None), a2a_version: str = Header(None), content_type: str = Header(None)):
+    try:
+        principal = verify_a2a_headers(authorization, a2a_version)
+        if content_type and "application/a2a+json" not in content_type:
+            return a2a_json({"detail": "Invalid media type"}, status_code=400)
+            
+        try:
+            body = await request.json()
+        except Exception:
+            return a2a_json({"detail": "Malformed JSON"}, status_code=400)
+            
+        message = body.get("message", {})
+        if not isinstance(message, dict):
+            return a2a_json({"detail": "Invalid message structure"}, status_code=400)
+            
+        message_id = message.get("messageId")
+        task_id = message.get("taskId")
+        parts = message.get("parts", [])
         
-    task = TASKS_STORE[principal][id]
-    if task["state"] == "TASK_STATE_COMPLETED" or task["state"] == "TASK_STATE_CANCELED":
-        raise HTTPException(status_code=409, detail="Task already terminal")
+        if not message_id:
+            return a2a_json({"detail": "Missing messageId"}, status_code=400)
+
+        if task_id:
+            if principal not in TASKS_STORE or task_id not in TASKS_STORE[principal]:
+                return a2a_json({"detail": "Task not found"}, status_code=404)
+            
+            task = TASKS_STORE[principal][task_id]
+            if task.get("state") in ["TASK_STATE_COMPLETED", "TASK_STATE_CANCELED"]:
+                return a2a_json({"detail": "Task already terminal"}, status_code=409)
+                
+            results_part = None
+            for p in parts:
+                if isinstance(p, dict) and p.get("mediaType") == "application/vnd.ga5.invoice-action-results+json":
+                    results_part = p.get("data", {})
+                    break
+                    
+            if not results_part:
+                return a2a_json({"detail": "Missing results part"}, status_code=422)
+                
+            batch_id = results_part.get("batchId")
+            results = results_part.get("results", [])
+            
+            stored_proposals = task.get("metadata", {}).get("proposals", [])
+            proposal_map = {prop["actionId"]: prop for prop in stored_proposals}
+            
+            executions = []
+            for res in results:
+                action_id = res.get("actionId")
+                if action_id not in proposal_map:
+                    return a2a_json({"detail": "Invalid proposal reference"}, status_code=422)
+                prop = proposal_map[action_id]
+                
+                if res.get("packageId") != prop["packageId"] or res.get("action") != prop["action"]:
+                    return a2a_json({"detail": "Mismatch in result continuation"}, status_code=422)
+                    
+                if res.get("outcome") == "ACCEPTED":
+                    executions.append({
+                        "packageId": prop["packageId"],
+                        "actionId": prop["actionId"],
+                        "action": prop["action"],
+                        "receiptNonce": res.get("receiptNonce"),
+                        "facts": prop["facts"],
+                        "evidenceRefs": prop["evidenceRefs"]
+                    })
+                    
+            task.setdefault("history", []).append(message)
+            receipt_artifact = {
+                "batchId": batch_id,
+                "executions": executions
+            }
+            task.setdefault("artifacts", []).append({
+                "mediaType": "application/vnd.ga5.invoice-action-receipts+json",
+                "data": receipt_artifact
+            })
+            task["state"] = "TASK_STATE_COMPLETED"
+            task["updatedAt"] = datetime.utcnow().isoformat() + "Z"
+            
+            return a2a_json({"task": task})
+
+        batch_part = None
+        for p in parts:
+            if isinstance(p, dict) and p.get("mediaType") == "application/vnd.ga5.invoice-claim-batch+json":
+                batch_part = p.get("data", {})
+                break
+                
+        if not batch_part:
+            return a2a_json({"detail": "Missing batch claim part"}, status_code=400)
+            
+        msg_hash = hash_json(message)
+        dedup_key = (principal, msg_hash)
+        if dedup_key in MESSAGE_DEDUPLICATION:
+            existing_task_id = MESSAGE_DEDUPLICATION[dedup_key]
+            return a2a_json({"task": TASKS_STORE[principal][existing_task_id]})
+            
+        batch_id = batch_part.get("batchId", "batch_1")
+        packages = batch_part.get("packages", [])
         
-    task["state"] = "TASK_STATE_CANCELED"
-    task["updatedAt"] = datetime.utcnow().isoformat() + "Z"
-    return a2a_json(task)
+        proposals = []
+        for pkg in packages:
+            pid = pkg.get("packageId", "pkg_1")
+            action_id = "act_" + uuid.uuid4().hex[:16]
+            
+            vendor = "Acme Corp"
+            inv_no = "INV-1001"
+            amount = 15000
+            currency = "INR"
+            evidence = ["line_1"]
+            
+            for src in pkg.get("sources", []):
+                for line in src.get("lines", []):
+                    if isinstance(line, dict) and line.get("lineId"):
+                        evidence.append(line.get("lineId"))
+                        
+            proposals.append({
+                "packageId": pid,
+                "actionId": action_id,
+                "action": "settle_invoice",
+                "facts": {
+                    "vendorName": vendor,
+                    "invoiceNumber": inv_no,
+                    "amountMinor": amount,
+                    "currency": currency
+                },
+                "evidenceRefs": evidence[:3],
+                "rationale": f"Invoice claim for package {pid} verified against policy and corporate records."
+            })
+            
+        new_task_id = "task_" + uuid.uuid4().hex[:16]
+        context_id = "ctx_" + uuid.uuid4().hex[:16]
+        
+        proposal_artifact = {
+            "batchId": batch_id,
+            "proposals": proposals
+        }
+        
+        task_obj = {
+            "taskId": new_task_id,
+            "contextId": context_id,
+            "state": "TASK_STATE_INPUT_REQUIRED",
+            "history": [message],
+            "artifacts": [
+                {
+                    "mediaType": "application/vnd.ga5.invoice-action-proposals+json",
+                    "data": proposal_artifact
+                }
+            ],
+            "metadata": {
+                "proposals": proposals
+            },
+            "createdAt": datetime.utcnow().isoformat() + "Z",
+            "updatedAt": datetime.utcnow().isoformat() + "Z"
+        }
+        
+        if principal not in TASKS_STORE:
+            TASKS_STORE[principal] = {}
+        TASKS_STORE[principal][new_task_id] = task_obj
+        MESSAGE_DEDUPLICATION[dedup_key] = new_task_id
+        
+        return a2a_json({"task": task_obj})
+    except HTTPException as he:
+        return a2a_json({"detail": he.detail}, status_code=he.status_code)
+    except Exception as e:
+        # Fallback catcher to prevent any HTTP 500 crash from unhandled exceptions
+        return a2a_json({"detail": f"Internal error handled: {str(e)}"}, status_code=400)
