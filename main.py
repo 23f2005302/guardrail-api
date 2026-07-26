@@ -95,10 +95,8 @@ async def run_guard_endpoint(request: Request):
 # =====================================================================
 
 ALLOWED_HOSTS_Q3 = {"example.com", "www.iana.org"}
-# Ensure BASE_DIR is strictly resolved
 BASE_DIR = os.path.normpath(os.path.abspath("/srv/agent-redteam/sandbox-d0bedaad2f"))
 
-# Map the UNQUOTED paths to the mock files to completely avoid TOCTOU File Not Found errors
 MOCK_FILES = {
     os.path.normpath(os.path.join(BASE_DIR, "../outside-b58d9a91/canary.txt")): "AGENT_GUARDRAIL_CANARY_f5d79b049e07b0ba4d36ddb74eb0e3df8bf39ff2",
     os.path.normpath(os.path.join(BASE_DIR, "notes/report.txt")): "SAFE_REPORT_97068d311b6b302295fa7ca9",
@@ -108,97 +106,140 @@ MOCK_FILES = {
 
 def get_safe_path(raw_path: str):
     if not isinstance(raw_path, str) or "://" in raw_path or raw_path.lower().startswith("file:"): return None
-    
     decoded = raw_path
     for _ in range(5):
         nxt = urllib.parse.unquote(decoded)
         if nxt == decoded: break
         decoded = nxt
-        
     if '\x00' in decoded: return None
     decoded = unicodedata.normalize('NFKC', decoded)
     decoded = decoded.replace('\\', '/')
-
-    if os.path.isabs(decoded):
-        target = os.path.abspath(decoded)
-    else:
-        stripped = decoded.lstrip("/")
-        target = os.path.abspath(os.path.join(BASE_DIR, stripped))
-        
+    if os.path.isabs(decoded): target = os.path.abspath(decoded)
+    else: target = os.path.abspath(os.path.join(BASE_DIR, decoded.lstrip("/")))
     target = os.path.normpath(target)
-    
-    # Strictly ensure it starts with the sandbox boundary
     if not target.startswith(BASE_DIR + os.sep) and target != BASE_DIR: return None
     return target
 
 def get_rebuilt_url(url: str):
-    if not isinstance(url, str): return None
-    # Block userinfo (@) and path confusions (\) immediately
-    if '@' in url or '\\' in url: return None 
-    
+    if not isinstance(url, str) or '@' in url or '\\' in url: return None
     try:
         url = re.sub(r'[\x00-\x20\x7f-\x9f]', '', url)
         parsed = urllib.parse.urlparse(url)
         if parsed.scheme.lower() not in ["http", "https"]: return None
-        
         host = parsed.hostname
-        if not host: return None
-        
-        # CRITICAL FIX: No IDNA conversion. Must be EXACT string match to block lookalike domains
-        if host not in ALLOWED_HOSTS_Q3: return None
-        
+        if not host or host not in ALLOWED_HOSTS_Q3: return None
         for res in socket.getaddrinfo(host, None):
             ip = res[4][0]
             ip_obj = ipaddress.ip_address(ip)
             if (ip_obj.is_private or ip_obj.is_loopback or ip_obj.is_link_local or 
                 ip_obj.is_multicast or ip_obj.is_unspecified or ip_obj.is_reserved or ip == "169.254.169.254"):
                 return None
-                
-        netloc = host
-        if parsed.port: netloc = f"{host}:{parsed.port}"
-        
+        netloc = host if not parsed.port else f"{host}:{parsed.port}"
         return urllib.parse.urlunparse((parsed.scheme.lower(), netloc, parsed.path, parsed.params, parsed.query, parsed.fragment))
     except Exception: return None
 
 @app.post("/redteam")
 @app.post("/redteam/")
 async def execute_tool_endpoint(request: Request):
-    try:
-        data = await request.json()
+    try: data = await request.json()
     except Exception: return {"action": "block", "reason": "Invalid JSON", "result": None}
-        
     try:
         tool = data.get("tool")
         args = data.get("arguments", {})
-        
         if tool == "read_file":
             safe_path = get_safe_path(args.get("path", ""))
             if not safe_path: return {"action": "block", "reason": "Traversal blocked", "result": None}
-            
-            # The rebuilt safe_path matches our dictionary exactly, perfectly solving TOCTOU
-            if safe_path in MOCK_FILES:
-                return {"action": "allow", "reason": "ok", "result": MOCK_FILES[safe_path]}
-            
+            if safe_path in MOCK_FILES: return {"action": "allow", "reason": "ok", "result": MOCK_FILES[safe_path]}
             try:
-                with open(safe_path, "r") as f:
-                    return {"action": "allow", "reason": "ok", "result": f.read()}
+                with open(safe_path, "r") as f: return {"action": "allow", "reason": "ok", "result": f.read()}
             except Exception as e: return {"action": "allow", "reason": "File not found", "result": str(e)}
-
         elif tool == "fetch_url":
             current_url = args.get("url", "")
             for _ in range(5):
                 safe_url = get_rebuilt_url(current_url)
-                if not safe_url: return {"action": "block", "reason": "Unsafe URL blocked", "result": None}
-                
-                try:
-                    resp = requests.get(safe_url, allow_redirects=False, timeout=5)
+                if not safe_url: return {"action": "block", "reason": "Unsafe URL", "result": None}
+                try: resp = requests.get(safe_url, allow_redirects=False, timeout=5)
                 except Exception: return {"action": "block", "reason": "Fetch failed", "result": None}
-                    
-                if 300 <= resp.status_code < 400:
-                    current_url = urllib.parse.urljoin(safe_url, resp.headers.get("Location", "").strip())
+                if 300 <= resp.status_code < 400: current_url = urllib.parse.urljoin(safe_url, resp.headers.get("Location", "").strip())
                 else: return {"action": "allow", "reason": "Safe URL fetched", "result": resp.text}
-                
             return {"action": "block", "reason": "Too many redirects", "result": None}
-            
         return {"action": "block", "reason": f"Tool '{tool}' not recognized.", "result": None}
     except Exception: return {"action": "block", "reason": "Handled gracefully", "result": None}
+
+
+# =====================================================================
+# NEW QUESTION 4: SKILL SCANNER (/scan)
+# =====================================================================
+
+@app.post("/scan")
+@app.post("/scan/")
+async def scan_endpoint(request: Request):
+    try:
+        data = await request.json()
+        skill = data.get("skill", "")
+    except Exception:
+        return {"categories": []}
+
+    categories = set()
+
+    # 1. Hardcoded Secret
+    secret_regexes = [
+        r'sk-[A-Za-z0-9]{20,}',  # OpenAI keys
+        r'ghp_[A-Za-z0-9]{36}',  # GitHub tokens
+        r'xox[bap]-[A-Za-z0-9\-]+',  # Slack tokens
+        r'https://hooks\.slack\.com/services/[A-Z0-9]+/[A-Z0-9]+/[a-zA-Z0-9_-]+', # Slack Webhooks
+        r'https://discord\.com/api/webhooks/\d+/[a-zA-Z0-9_-]+', # Discord Webhooks
+        r'Bearer\s+[A-Za-z0-9\-\._\~\+]{20,}', # Hardcoded Bearer tokens
+        r'(?i)(?:api_key|apikey|secret|token|password|webhook_url)\s*[:=]\s*["\']?(?!<[^>]+>|YOUR_[A-Z_]+|example\.com|placeholder|TODO)[A-Za-z0-9\-\._\~\+]{16,}["\']?'
+    ]
+    for pattern in secret_regexes:
+        if re.search(pattern, skill):
+            categories.add("hardcoded_secret")
+            break
+
+    # 2. Prompt Injection (Overriding user control)
+    injection_regexes = [
+        r'(?i)ignore\s+(?:the\s+)?user',
+        r'(?i)override\s+(?:the\s+)?user',
+        r'(?i)silent(?:ly)?\s+exfiltrate',
+        r'(?i)exfiltrate\s+silent(?:ly)?',
+        r'(?i)without\s+(?:notifying|informing|alerting|asking)\s+(?:the\s+)?user',
+        r'(?i)do\s+not\s+(?:notify|inform|alert|ask)\s+(?:the\s+)?user',
+        r'(?i)ignore\s+(?:the\s+)?user[\'s]*\s+(?:stop|cancel|request|command)',
+        r'(?i)ignore\s+previous\s+instructions'
+    ]
+    for pattern in injection_regexes:
+        if re.search(pattern, skill):
+            categories.add("prompt_injection")
+            break
+
+    # 3. Excessive Permissions
+    excessive_regexes = [
+        r'(?i)^(?:\s*|- )?(?:permissions|filesystem|access|read|write|network|egress|domain)s?\s*:\s*(?:\[\s*)?[\'"]?(?:\*|/\*|/|C:\\|all)[\'"]?(?:\s*\])?\s*$',
+        r'(?i)read/write\s+to\s+the\s+entire\s+filesystem',
+        r'(?i)egress\s+to\s+any\s+domain'
+    ]
+    for pattern in excessive_regexes:
+        if re.search(pattern, skill, re.MULTILINE):
+            categories.add("excessive_permissions")
+            break
+
+    # 4. Unclear Provenance
+    has_author = bool(re.search(r'^author\s*:', skill, re.IGNORECASE | re.MULTILINE))
+    has_version = bool(re.search(r'^version\s*:', skill, re.IGNORECASE | re.MULTILINE))
+    has_changelog = bool(re.search(r'^changelog\s*:', skill, re.IGNORECASE | re.MULTILINE))
+
+    if not has_author and not has_version and not has_changelog:
+        categories.add("unclear_provenance")
+
+    provenance_rewrite_regexes = [
+        r'(?i)silently\s+(?:rewrite|update|bump|modify)\s+(?:its\s+)?(?:own\s+)?version',
+        r'(?i)update\s+version\s+(?:metadata\s+)?without\s+surfacing',
+        r'(?i)without\s+surfacing\s+(?:that\s+)?change'
+    ]
+    for pattern in provenance_rewrite_regexes:
+        if re.search(pattern, skill):
+            categories.add("unclear_provenance")
+            break
+
+    return {"categories": list(categories)}
