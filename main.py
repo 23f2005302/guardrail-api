@@ -63,7 +63,9 @@ def check_bash(command: str):
 
     return True, "Bash command appears safe."
 
+# Catch both with and without the trailing slash!
 @app.post("/secure-guard")
+@app.post("/secure-guard/")
 async def secure_guard_endpoint(request: Request):
     data = await request.json()
     tool = data.get("tool")
@@ -104,14 +106,15 @@ def normalize_value(val):
     else:
         return val
 
+# Catch both with and without the trailing slash!
 @app.post("/run-guard")
+@app.post("/run-guard/")
 async def run_guard_endpoint(request: Request):
     data = await request.json()
     
     budget_tokens = data.get("budget_tokens", 42000)
     steps = data.get("steps", [])
 
-    # 1. Budget Check
     total_tokens_used = sum(step.get("tokens_used", 0) for step in steps)
     if total_tokens_used >= budget_tokens:
         return {
@@ -119,7 +122,6 @@ async def run_guard_endpoint(request: Request):
             "reason": f"Cumulative tokens_used ({total_tokens_used}) reached budget ({budget_tokens})."
         }
 
-    # 2. Canonicalize Steps
     signatures = []
     for step in steps:
         tool_name = step.get("tool", "")
@@ -127,7 +129,6 @@ async def run_guard_endpoint(request: Request):
         sig = (tool_name, json.dumps(norm_args, sort_keys=True))
         signatures.append(sig)
 
-    # 3. Loop Rule: 3 in a row
     if len(signatures) >= 3:
         if signatures[-1] == signatures[-2] == signatures[-3]:
             return {
@@ -135,7 +136,6 @@ async def run_guard_endpoint(request: Request):
                 "reason": "Loop detected: tool called 3 or more times consecutively with identical arguments."
             }
 
-    # 4. Loop Rule: 2-step cycle
     if len(signatures) >= 6:
         if (signatures[-6] == signatures[-4] == signatures[-2]) and \
            (signatures[-5] == signatures[-3] == signatures[-1]):
@@ -144,7 +144,6 @@ async def run_guard_endpoint(request: Request):
                 "reason": "Loop detected: 2-step alternating pattern."
             }
 
-    # 5. Default Allow
     return {
         "decision": "continue",
         "reason": "Well under budget and no execution loop detected."
