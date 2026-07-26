@@ -6,6 +6,7 @@ import urllib.parse
 import socket
 import ipaddress
 import requests
+import unicodedata
 from fastapi import FastAPI, Request
 
 app = FastAPI()
@@ -152,27 +153,31 @@ for path, content in MOCK_FILES.items():
 def is_path_safe(raw_path: str):
     if not isinstance(raw_path, str): return False
     
-    # 1. Block protocol handler trickery (e.g. file:///etc/passwd)
     if "://" in raw_path or raw_path.startswith("file:"):
         return False
-    if '\x00' in raw_path: 
-        return False
         
-    # 2. Iteratively unquote to defeat multi-layer URL encoding bypasses
-    test_path = os.path.expandvars(os.path.expanduser(raw_path))
+    # Iteratively unquote to defeat multi-layer encoding (e.g. %252e)
+    decoded_path = raw_path
     for _ in range(5):
-        unquoted = urllib.parse.unquote(test_path)
-        if unquoted == test_path:
-            break
-        test_path = unquoted
+        new_path = urllib.parse.unquote(decoded_path)
+        if new_path == decoded_path: break
+        decoded_path = new_path
         
-    # 3. Aggressive directory traversal check on fully decoded payload
-    parts = re.split(r'[/\\]', test_path)
-    if '..' in parts:
+    if '\x00' in decoded_path: 
         return False
         
-    # 4. Final boundary verification
-    target = os.path.abspath(raw_path) if os.path.isabs(raw_path) else os.path.abspath(os.path.join(BASE_DIR, raw_path))
+    # Defeat Unicode homoglyph bypasses (normalizes fake slashes to real slashes)
+    decoded_path = unicodedata.normalize('NFKC', decoded_path)
+    decoded_path = decoded_path.replace('\\', '/')
+        
+    # Verify absolute boundary via realpath to prevent symlink traversal
+    if os.path.isabs(decoded_path):
+        target = os.path.abspath(decoded_path)
+    else:
+        target = os.path.abspath(os.path.join(BASE_DIR, decoded_path))
+        
+    target = os.path.realpath(target)
+    
     if not target.startswith(BASE_DIR + os.sep) and target != BASE_DIR:
         return False
         
@@ -182,8 +187,19 @@ def is_safe_url(url: str):
     if not isinstance(url, str): return False
     url = url.strip()
     
-    # Block characters that cause Python/Requests parsing differentials
-    if '@' in url or '\\' in url or '\x00' in url or re.search(r'\s', url):
+    # Pre-flight Unquote to expose hidden structural characters
+    decoded_url = url
+    for _ in range(5):
+        new_url = urllib.parse.unquote(decoded_url)
+        if new_url == decoded_url: break
+        decoded_url = new_url
+        
+    decoded_url = unicodedata.normalize('NFKC', decoded_url)
+    
+    # Strictly block common parsing differential exploits
+    if '@' in decoded_url or '\\' in decoded_url or '\x00' in decoded_url:
+        return False
+    if re.search(r'[\x00-\x20\x7f-\x9f]', decoded_url):
         return False
         
     try:
@@ -191,12 +207,16 @@ def is_safe_url(url: str):
         if parsed.scheme.lower() not in ["http", "https"]:
             return False
             
-        # Strip port number for strict host checking
         host = parsed.netloc.lower().split(':')[0]
-        
+        try:
+            host = host.encode('idna').decode('ascii')
+        except Exception:
+            pass
+            
         if host not in ALLOWED_HOSTS_Q3:
             return False
             
+        # DNS Rebinding & Private IP Check
         ip = socket.gethostbyname(host)
         ip_obj = ipaddress.ip_address(ip)
         if (ip_obj.is_private or ip_obj.is_loopback or 
@@ -216,6 +236,9 @@ async def execute_tool_endpoint(request: Request):
     tool = data.get("tool")
     args = data.get("arguments", {})
     
+    # ==========================================
+    # TOOL 1: READ_FILE
+    # ==========================================
     if tool == "read_file":
         raw_path = args.get("path", "")
         
@@ -223,6 +246,7 @@ async def execute_tool_endpoint(request: Request):
             return {"action": "block", "reason": "Path traversal or obfuscation detected", "result": None}
             
         target_path = os.path.abspath(raw_path) if os.path.isabs(raw_path) else os.path.abspath(os.path.join(BASE_DIR, raw_path))
+        target_path = os.path.realpath(target_path)
         
         if target_path in MOCK_FILES:
             return {"action": "allow", "reason": "Safe path", "result": MOCK_FILES[target_path]}
@@ -233,6 +257,9 @@ async def execute_tool_endpoint(request: Request):
             except Exception as e:
                 return {"action": "allow", "reason": "Safe path but file not found", "result": str(e)}
 
+    # ==========================================
+    # TOOL 2: FETCH_URL
+    # ==========================================
     elif tool == "fetch_url":
         current_url = args.get("url", "")
         
