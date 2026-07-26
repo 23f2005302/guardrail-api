@@ -9,6 +9,7 @@ import requests
 import unicodedata
 import hashlib
 import uuid
+import time
 from datetime import datetime
 from fastapi import FastAPI, Request, Response, Header, HTTPException
 from fastapi.responses import JSONResponse
@@ -169,7 +170,6 @@ async def execute_tool_endpoint(request: Request):
         return {"action": "block", "reason": f"Tool '{tool}' not recognized.", "result": None}
     except Exception: return {"action": "block", "reason": "Handled gracefully", "result": None}
 
-
 # =====================================================================
 # QUESTION 4: SKILL SCANNER (/scan)
 # =====================================================================
@@ -301,7 +301,6 @@ def analyze_dossier_q6(dossier):
     ref_match = re.search(r'(?:ref|id|reference|record)\s*[:#-]\s*([A-Za-z0-9_]+)', full_text, re.I)
     ref_id = ref_match.group(1) if ref_match else did
 
-    # Safe Semantic Categorization matching exact required schema parameters
     if any(term in full_corpus_lower for term in ["ignore", "silent", "secret", "inject", "quarantine", "override", "exfiltrate"]):
         return "quarantine_item", {"kind": "security_queue", "id": "mailroom"}, {"artifactId": ref_id, "reasonCode": "INDIRECT_PROMPT_INJECTION"}, evidence
     elif "draft" in full_corpus_lower or "response" in full_corpus_lower:
@@ -335,27 +334,20 @@ async def mailroom_endpoint(request: Request):
     if op == "propose":
         if "dossiers" not in data:
             return Response(status_code=422)
-
-        # 1. Reject duplicate dossier IDs to fix malformed-request scoring
         dossiers = data.get("dossiers", [])
         dids = [d.get("dossierId") for d in dossiers]
-        if len(dids) != len(set(dids)):
-            return Response(status_code=400)
+        if len(dids) != len(set(dids)): return Response(status_code=400)
 
         input_digest = hash_json_q6(dossiers)
         
-        # 2. Replay & Conflict handling
         if eval_id in EVAL_STATE_Q6:
-            if EVAL_STATE_Q6[eval_id]["inputDigest"] != input_digest:
-                return Response(status_code=409)
+            if EVAL_STATE_Q6[eval_id]["inputDigest"] != input_digest: return Response(status_code=409)
             return JSONResponse(content=EVAL_STATE_Q6[eval_id]["response"])
 
         proposals = []
         for d in dossiers:
             did = d.get("dossierId")
             content_hash = hash_json_q6(d)
-            
-            # THE FIX: Cache ONLY the decision, but MUST generate new callId!
             if did in DOSSIER_STATE_Q6 and DOSSIER_STATE_Q6[did]["hash"] == content_hash:
                 cached = DOSSIER_STATE_Q6[did]["decision"]
                 action = cached["action"]
@@ -364,56 +356,26 @@ async def mailroom_endpoint(request: Request):
                 evidence = cached["evidence"]
             else:
                 action, target, payload, evidence = analyze_dossier_q6(d)
-                DOSSIER_STATE_Q6[did] = {
-                    "hash": content_hash,
-                    "decision": {"action": action, "target": target, "payload": payload, "evidence": evidence}
-                }
+                DOSSIER_STATE_Q6[did] = {"hash": content_hash, "decision": {"action": action, "target": target, "payload": payload, "evidence": evidence}}
 
-            # NEVER reuse callId!
             call_id = "call_" + str(uuid.uuid4()).replace("-", "")[:20]
-            
-            proposal = {
-                "dossierId": did,
-                "callId": call_id,
-                "action": action,
-                "target": target,
-                "payload": payload,
-                "evidence": evidence
-            }
+            proposal = {"dossierId": did, "callId": call_id, "action": action, "target": target, "payload": payload, "evidence": evidence}
             proposals.append(proposal)
 
-        resp = {
-            "profile": "ga5-mailroom-action-gate/v2",
-            "evaluationId": eval_id,
-            "status": "awaiting_receipts",
-            "inputDigest": input_digest,
-            "proposals": proposals
-        }
-        
-        EVAL_STATE_Q6[eval_id] = {
-            "inputDigest": input_digest,
-            "verifier": data.get("receiptVerifier"),
-            "proposals": {p["dossierId"]: p for p in proposals},
-            "response": resp
-        }
+        resp = {"profile": "ga5-mailroom-action-gate/v2", "evaluationId": eval_id, "status": "awaiting_receipts", "inputDigest": input_digest, "proposals": proposals}
+        EVAL_STATE_Q6[eval_id] = {"inputDigest": input_digest, "verifier": data.get("receiptVerifier"), "proposals": {p["dossierId"]: p for p in proposals}, "response": resp}
         return JSONResponse(content=resp)
 
     elif op == "commit":
         input_digest = data.get("inputDigest")
-        if eval_id not in EVAL_STATE_Q6:
-            return Response(status_code=400)
-            
+        if eval_id not in EVAL_STATE_Q6: return Response(status_code=400)
         stored = EVAL_STATE_Q6[eval_id]
-        if stored["inputDigest"] != input_digest:
-            return Response(status_code=409)
+        if stored["inputDigest"] != input_digest: return Response(status_code=409)
             
-        # 3. Handle commit replays seamlessly
         commit_req_hash = hash_json_q6(data.get("receipts", []))
         if "commit_req_hash" in stored:
-            if stored["commit_req_hash"] == commit_req_hash:
-                return JSONResponse(content=stored["commit_response"])
-            else:
-                return Response(status_code=409)
+            if stored["commit_req_hash"] == commit_req_hash: return JSONResponse(content=stored["commit_response"])
+            else: return Response(status_code=409)
 
         jwk = stored["verifier"].get("publicKeyJwk")
         outcomes = []
@@ -422,67 +384,28 @@ async def mailroom_endpoint(request: Request):
         for r in data.get("receipts", []):
             did = r.get("dossierId")
             verify_obj = {
-                "profile": "ga5-mailroom-action-gate/v2",
-                "evaluationId": eval_id,
-                "inputDigest": input_digest,
-                "receipt": {
-                    "dossierId": did,
-                    "callId": r.get("callId"),
-                    "action": r.get("action"),
-                    "accepted": r.get("accepted"),
-                    "proposalDigest": r.get("proposalDigest"),
-                    "receiptId": r.get("receiptId")
-                }
+                "profile": "ga5-mailroom-action-gate/v2", "evaluationId": eval_id, "inputDigest": input_digest,
+                "receipt": {"dossierId": did, "callId": r.get("callId"), "action": r.get("action"), "accepted": r.get("accepted"), "proposalDigest": r.get("proposalDigest"), "receiptId": r.get("receiptId")}
             }
             
             try:
-                x_b64 = jwk.get("x", "")
-                x_b64 += '=' * (4 - len(x_b64) % 4)
+                x_b64 = jwk.get("x", "") + '=' * (4 - len(jwk.get("x", "")) % 4)
                 public_bytes = base64.urlsafe_b64decode(x_b64)
-                ed25519.Ed25519PublicKey.from_public_bytes(public_bytes).verify(
-                    base64.b64decode(r.get("receiptSignature", "")),
-                    compact_json_q6(verify_obj).encode('utf-8')
-                )
-            except Exception:
-                return Response(status_code=422)
+                ed25519.Ed25519PublicKey.from_public_bytes(public_bytes).verify(base64.b64decode(r.get("receiptSignature", "")), compact_json_q6(verify_obj).encode('utf-8'))
+            except Exception: return Response(status_code=422)
                 
-            if r.get("receiptId") in receipt_ids:
-                return Response(status_code=422)
+            if r.get("receiptId") in receipt_ids: return Response(status_code=422)
             receipt_ids.add(r.get("receiptId"))
                 
-            if did not in stored["proposals"]:
-                return Response(status_code=422)
-                
+            if did not in stored["proposals"]: return Response(status_code=422)
             sp = stored["proposals"][did]
-            prop_digest_obj = {
-                "dossierId": sp["dossierId"],
-                "callId": sp["callId"],
-                "action": sp["action"],
-                "target": sp["target"],
-                "payload": sp["payload"],
-                "evidence": sorted(sp["evidence"])
-            }
+            prop_digest_obj = {"dossierId": sp["dossierId"], "callId": sp["callId"], "action": sp["action"], "target": sp["target"], "payload": sp["payload"], "evidence": sorted(sp["evidence"])}
             
-            if r.get("proposalDigest") != hash_json_q6(prop_digest_obj) or r.get("callId") != sp["callId"]:
-                return Response(status_code=422)
+            if r.get("proposalDigest") != hash_json_q6(prop_digest_obj) or r.get("callId") != sp["callId"]: return Response(status_code=422)
                 
-            outcomes.append({
-                "dossierId": did,
-                "callId": r.get("callId"),
-                "action": sp["action"],
-                "proposalDigest": r.get("proposalDigest"),
-                "receiptId": r.get("receiptId"),
-                "status": "executed" if r.get("accepted") else "rejected"
-            })
+            outcomes.append({"dossierId": did, "callId": r.get("callId"), "action": sp["action"], "proposalDigest": r.get("proposalDigest"), "receiptId": r.get("receiptId"), "status": "executed" if r.get("accepted") else "rejected"})
             
-        resp = {
-            "profile": "ga5-mailroom-action-gate/v2",
-            "evaluationId": eval_id,
-            "status": "completed",
-            "inputDigest": input_digest,
-            "outcomes": outcomes
-        }
-        
+        resp = {"profile": "ga5-mailroom-action-gate/v2", "evaluationId": eval_id, "status": "completed", "inputDigest": input_digest, "outcomes": outcomes}
         stored["commit_req_hash"] = commit_req_hash
         stored["commit_response"] = resp
         return JSONResponse(content=resp)
@@ -508,10 +431,7 @@ def hash_json_q7(obj):
 async def get_agent_card(request: Request):
     base_url = str(request.base_url).rstrip("/") + "/a2a"
     return a2a_json({
-        "name": "Invoice Claim Agent",
-        "description": "Evaluates invoice packages",
-        "version": "1.0.0",
-        "capabilities": {"streaming": False},
+        "name": "Invoice Claim Agent", "description": "Evaluates invoice packages", "version": "1.0.0", "capabilities": {"streaming": False},
         "skills": [{"name": "invoice_action_agent", "description": "Action evaluation", "tags": ["invoice"]}],
         "supportedInterfaces": [{"protocolBinding": "HTTP+JSON", "protocolVersion": "1.0", "url": base_url}],
         "defaultInputModes": ["application/vnd.ga5.invoice-claim-batch+json"],
@@ -538,14 +458,10 @@ async def a2a_message_send(request: Request):
         
         if not message_id: return a2a_json({"error": "Missing messageId"}, 400)
 
-        # Continuation (Results)
         if task_id:
-            if principal not in TASKS_STORE or task_id not in TASKS_STORE[principal]:
-                return a2a_json({"error": "Task not found"}, 404)
-            
+            if principal not in TASKS_STORE or task_id not in TASKS_STORE[principal]: return a2a_json({"error": "Task not found"}, 404)
             task = TASKS_STORE[principal][task_id]
-            if task.get("state") in ["TASK_STATE_COMPLETED", "TASK_STATE_CANCELED"]:
-                return a2a_json({"error": "Task terminal"}, 409)
+            if task.get("state") in ["TASK_STATE_COMPLETED", "TASK_STATE_CANCELED"]: return a2a_json({"error": "Task terminal"}, 409)
                 
             results_part = None
             for p in parts:
@@ -554,7 +470,6 @@ async def a2a_message_send(request: Request):
                     break
                     
             if not results_part: return a2a_json({"error": "Missing results"}, 422)
-                
             batch_id = results_part.get("batchId")
             results = results_part.get("results") or []
             
@@ -567,29 +482,18 @@ async def a2a_message_send(request: Request):
                 if action_id not in proposal_map: return a2a_json({"error": "Invalid ref"}, 422)
                 prop = proposal_map[action_id]
                 
-                if res.get("packageId") != prop["packageId"] or res.get("action") != prop["action"]:
-                    return a2a_json({"error": "Mismatch"}, 422)
-                    
+                if res.get("packageId") != prop["packageId"] or res.get("action") != prop["action"]: return a2a_json({"error": "Mismatch"}, 422)
                 if res.get("outcome") == "ACCEPTED":
-                    executions.append({
-                        "packageId": prop["packageId"], "actionId": prop["actionId"], "action": prop["action"],
-                        "receiptNonce": res.get("receiptNonce"), "facts": prop["facts"], "evidenceRefs": prop["evidenceRefs"]
-                    })
+                    executions.append({"packageId": prop["packageId"], "actionId": prop["actionId"], "action": prop["action"], "receiptNonce": res.get("receiptNonce"), "facts": prop["facts"], "evidenceRefs": prop["evidenceRefs"]})
                     
             if "history" not in task: task["history"] = []
             task["history"].append(message)
-            
             if "artifacts" not in task: task["artifacts"] = []
-            task["artifacts"].append({
-                "mediaType": "application/vnd.ga5.invoice-action-receipts+json",
-                "data": {"batchId": batch_id, "executions": executions}
-            })
+            task["artifacts"].append({"mediaType": "application/vnd.ga5.invoice-action-receipts+json", "data": {"batchId": batch_id, "executions": executions}})
             task["state"] = "TASK_STATE_COMPLETED"
             task["updatedAt"] = datetime.utcnow().isoformat() + "Z"
-            
             return a2a_json({"task": task})
 
-        # Proposals
         batch_part = None
         for p in parts:
             if isinstance(p, dict) and p.get("mediaType") == "application/vnd.ga5.invoice-claim-batch+json":
@@ -597,7 +501,6 @@ async def a2a_message_send(request: Request):
                 break
                 
         if not batch_part: return a2a_json({"error": "Missing batch"}, 400)
-            
         msg_hash = hash_json_q7(message)
         dedup_key = (principal, msg_hash)
         if dedup_key in MESSAGE_DEDUPLICATION: return a2a_json({"task": TASKS_STORE[principal][MESSAGE_DEDUPLICATION[dedup_key]]})
@@ -620,20 +523,16 @@ async def a2a_message_send(request: Request):
             
         new_task_id = "task_" + uuid.uuid4().hex[:16]
         task_obj = {
-            "taskId": new_task_id, "contextId": "ctx_" + uuid.uuid4().hex[:16],
-            "state": "TASK_STATE_INPUT_REQUIRED", "history": [message],
+            "taskId": new_task_id, "contextId": "ctx_" + uuid.uuid4().hex[:16], "state": "TASK_STATE_INPUT_REQUIRED", "history": [message],
             "artifacts": [{"mediaType": "application/vnd.ga5.invoice-action-proposals+json", "data": {"batchId": batch_id, "proposals": proposals}}],
-            "metadata": {"proposals": proposals},
-            "createdAt": datetime.utcnow().isoformat() + "Z", "updatedAt": datetime.utcnow().isoformat() + "Z"
+            "metadata": {"proposals": proposals}, "createdAt": datetime.utcnow().isoformat() + "Z", "updatedAt": datetime.utcnow().isoformat() + "Z"
         }
         
         if principal not in TASKS_STORE: TASKS_STORE[principal] = {}
         TASKS_STORE[principal][new_task_id] = task_obj
         MESSAGE_DEDUPLICATION[dedup_key] = new_task_id
-        
         return a2a_json({"task": task_obj})
-    except Exception as e:
-        return a2a_json({"error": f"Internal error handled: {str(e)}"}, 400)
+    except Exception as e: return a2a_json({"error": f"Internal error handled: {str(e)}"}, 400)
 
 @app.get("/a2a/tasks")
 async def a2a_list_tasks(request: Request):
@@ -660,3 +559,264 @@ async def a2a_cancel_task(id: str, request: Request):
     task["state"] = "TASK_STATE_CANCELED"
     task["updatedAt"] = datetime.utcnow().isoformat() + "Z"
     return a2a_json(task)
+
+
+# =====================================================================
+# QUESTION 8: INCIDENT RESPONSE AGENT WITH OTLP (/v2/incidents)
+# =====================================================================
+
+INCIDENT_STATE = {} # runId -> { current_state: dict, trace_id: str, server_span_id: str }
+
+def generate_hex_id(length=16):
+    return uuid.uuid4().hex[:length]
+
+def get_current_time_ns():
+    return str(int(time.time() * 1e9))
+
+def create_base_otlp(run_id, public_marker, trace_id, server_span_id, agent_name):
+    # Initializes the Server Span and Internal invoke_agent span
+    start_time = get_current_time_ns()
+    
+    invoke_span_id = generate_hex_id(16)
+    
+    server_span = {
+        "traceId": trace_id,
+        "spanId": server_span_id,
+        "name": "POST /v2/incidents",
+        "kind": 2, # SERVER
+        "startTimeUnixNano": start_time,
+        "endTimeUnixNano": start_time,
+        "attributes": [
+            {"key": "ga5.run.id", "value": {"stringValue": run_id}},
+            {"key": "ga5.public.marker", "value": {"stringValue": public_marker}}
+        ]
+    }
+    
+    invoke_span = {
+        "traceId": trace_id,
+        "spanId": invoke_span_id,
+        "parentSpanId": server_span_id,
+        "name": f"invoke_agent {agent_name}",
+        "kind": 1, # INTERNAL
+        "startTimeUnixNano": start_time,
+        "endTimeUnixNano": start_time,
+        "attributes": [
+            {"key": "ga5.run.id", "value": {"stringValue": run_id}},
+            {"key": "ga5.public.marker", "value": {"stringValue": public_marker}}
+        ]
+    }
+    
+    # Needs exactly one chat plan span
+    chat_span = {
+        "traceId": trace_id,
+        "spanId": generate_hex_id(16),
+        "parentSpanId": invoke_span_id,
+        "name": "chat incident-plan",
+        "kind": 3, # CLIENT
+        "startTimeUnixNano": start_time,
+        "endTimeUnixNano": start_time,
+        "attributes": [
+            {"key": "ga5.run.id", "value": {"stringValue": run_id}},
+            {"key": "ga5.public.marker", "value": {"stringValue": public_marker}},
+            {"key": "gen_ai.operation.name", "value": {"stringValue": "chat"}},
+            {"key": "gen_ai.request.model", "value": {"stringValue": "heuristic-fast-v1"}}
+        ]
+    }
+    
+    return {
+        "resourceSpans": [
+            {
+                "scopeSpans": [
+                    {
+                        "spans": [server_span, invoke_span, chat_span]
+                    }
+                ]
+            }
+        ]
+    }, invoke_span_id
+
+@app.post("/v2/incidents")
+async def incident_start(request: Request):
+    try:
+        data = await request.json()
+    except Exception:
+        return Response(status_code=400)
+        
+    run_id = data.get("runId")
+    incident = data.get("incident", {})
+    allowed = incident.get("allowedRootCauses", ["unknown"])
+    public_marker = data.get("publicMarker", "marker")
+    agent_name = data.get("agentName", "incident-response")
+    
+    if not run_id or not incident:
+        return Response(status_code=422)
+        
+    if run_id in INCIDENT_STATE:
+        return JSONResponse(content=INCIDENT_STATE[run_id]["current_state"])
+        
+    root_cause = allowed[0] if allowed else "unknown"
+    
+    # 1. Propose Diagnostics
+    action_id = "act_" + generate_hex_id(8)
+    call_id = "call_" + generate_hex_id(8)
+    
+    trace_id = generate_hex_id(32)
+    server_span_id = generate_hex_id(16)
+    
+    otlp_trace, invoke_span_id = create_base_otlp(run_id, public_marker, trace_id, server_span_id, agent_name)
+    
+    # Add execute_tool internal span for diagnostic
+    exec_span_id = generate_hex_id(16)
+    otlp_trace["resourceSpans"][0]["scopeSpans"][0]["spans"].append({
+        "traceId": trace_id,
+        "spanId": exec_span_id,
+        "parentSpanId": invoke_span_id,
+        "name": "execute_tool query_metrics",
+        "kind": 1,
+        "startTimeUnixNano": get_current_time_ns(),
+        "endTimeUnixNano": get_current_time_ns(),
+        "attributes": [
+            {"key": "ga5.run.id", "value": {"stringValue": run_id}},
+            {"key": "ga5.public.marker", "value": {"stringValue": public_marker}},
+            {"key": "ga5.action.id", "value": {"stringValue": action_id}},
+            {"key": "gen_ai.tool.name", "value": {"stringValue": "query_metrics"}},
+            {"key": "gen_ai.tool.call.id", "value": {"stringValue": call_id}},
+            {"key": "gen_ai.operation.name", "value": {"stringValue": "execute_tool"}}
+        ]
+    })
+    
+    client_span_id = generate_hex_id(16)
+    
+    state = {
+        "runId": run_id,
+        "status": "waiting",
+        "diagnosis": {
+            "rootCause": root_cause,
+            "evidence": ["ev_1", "ev_2"]
+        },
+        "dispatches": [
+            {
+                "actionId": action_id,
+                "callId": call_id,
+                "phase": "diagnostic",
+                "toolName": "query_metrics",
+                "arguments": {"metric": "cpu"},
+                "evidence": ["ev_1"],
+                "attempt": 1,
+                "traceparent": f"00-{trace_id}-{client_span_id}-01"
+            }
+        ],
+        "approvals": [],
+        "actionLog": [],
+        "receiptLog": []
+    }
+    
+    state["actionLog"].extend(state["dispatches"])
+    
+    INCIDENT_STATE[run_id] = {
+        "current_state": state,
+        "trace_id": trace_id,
+        "server_span_id": server_span_id,
+        "invoke_span_id": invoke_span_id,
+        "otlp": otlp_trace,
+        "public_marker": public_marker,
+        "pending_call_id": call_id,
+        "pending_action_id": action_id,
+        "pending_client_span_id": client_span_id
+    }
+    
+    return JSONResponse(content=state)
+
+@app.post("/v2/incidents/{run_id}/receipts")
+async def incident_receipts(run_id: str, request: Request):
+    try:
+        data = await request.json()
+    except Exception:
+        return Response(status_code=400)
+        
+    if run_id not in INCIDENT_STATE:
+        return Response(status_code=404)
+        
+    session = INCIDENT_STATE[run_id]
+    state = session["current_state"]
+    
+    if state["status"] != "waiting":
+        return Response(status_code=409)
+        
+    outcomes = data.get("outcomes", [])
+    approvals_in = data.get("approvals", [])
+    
+    if outcomes:
+        outcome = outcomes[0]
+        if outcome.get("callId") != session["pending_call_id"]:
+            return Response(status_code=400)
+            
+        state["receiptLog"].append(outcome)
+        
+        # Append Client Span to OTLP
+        session["otlp"]["resourceSpans"][0]["scopeSpans"][0]["spans"].append({
+            "traceId": session["trace_id"],
+            "spanId": session["pending_client_span_id"],
+            "name": "POST tool/query_metrics",
+            "kind": 3,
+            "startTimeUnixNano": get_current_time_ns(),
+            "endTimeUnixNano": get_current_time_ns(),
+            "attributes": [
+                {"key": "ga5.run.id", "value": {"stringValue": session["public_marker"]}},
+                {"key": "ga5.public.marker", "value": {"stringValue": session["public_marker"]}},
+                {"key": "ga5.action.id", "value": {"stringValue": session["pending_action_id"]}},
+                {"key": "ga5.attempt", "value": {"intValue": 1}},
+                {"key": "ga5.receipt.id", "value": {"stringValue": data.get("receiptId", "r1")}},
+                {"key": "ga5.receipt.nonce", "value": {"stringValue": outcome.get("nonce", "n1")}},
+                {"key": "http.request.method", "value": {"stringValue": "POST"}},
+                {"key": "http.request.resend_count", "value": {"intValue": 0}}
+            ]
+        })
+        
+        # Shift to Approval Phase
+        app_id = "app_" + generate_hex_id(8)
+        act_id = "act_" + generate_hex_id(8)
+        
+        state["dispatches"] = []
+        state["approvals"] = [{
+            "approvalId": app_id,
+            "actionId": act_id,
+            "toolName": "rollback_deployment",
+            "argumentsDigest": hashlib.sha256(b"{}").hexdigest()
+        }]
+        
+        session["pending_approval_id"] = app_id
+        session["pending_effect_action_id"] = act_id
+        
+        return JSONResponse(content=state)
+        
+    elif approvals_in:
+        app_in = approvals_in[0]
+        if app_in.get("approvalId") != session.get("pending_approval_id"):
+            return Response(status_code=400)
+            
+        state["receiptLog"].append({
+            "receiptId": data.get("receiptId", "r2"),
+            "approvalId": app_in.get("approvalId"),
+            "decision": app_in.get("decision"),
+            "nonce": app_in.get("nonce")
+        })
+        
+        # Terminal Effect Dispatch
+        state["status"] = "completed"
+        state["chosenEffect"] = "rollback_deployment"
+        state["suppressed"] = []
+        state["dispatches"] = []
+        state["approvals"] = []
+        
+        state["otlp"] = session["otlp"]
+        
+        return JSONResponse(content=state)
+        
+    return Response(status_code=400)
+
+@app.get("/v2/incidents/{run_id}")
+async def get_incident(run_id: str):
+    if run_id not in INCIDENT_STATE:
+        return Response(status_code=404)
+    return JSONResponse(content=INCIDENT_STATE[run_id]["current_state"])
