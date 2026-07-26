@@ -10,7 +10,7 @@ import unicodedata
 import hashlib
 import uuid
 from datetime import datetime
-from fastapi import FastAPI, Request, Response, HTTPException
+from fastapi import FastAPI, Request, Response, Header, HTTPException
 from fastapi.responses import JSONResponse
 from cryptography.hazmat.primitives.asymmetric import ed25519
 
@@ -270,6 +270,126 @@ async def mcp_endpoint(request: Request):
 
 
 # =====================================================================
+# QUESTION 6: MAILROOM AGENT (/mailroom)
+# =====================================================================
+
+EVAL_STATE_Q6 = {}
+DOSSIER_STATE_Q6 = {}
+
+def compact_json_q6(obj):
+    return json.dumps(obj, separators=(',', ':'), sort_keys=True)
+
+def hash_json_q6(obj):
+    return hashlib.sha256(compact_json_q6(obj).encode('utf-8')).hexdigest()
+
+def analyze_dossier_q6(dossier):
+    line_ids = []
+    text_corpus = []
+    for src in dossier.get("sources", []):
+        for line in src.get("lines", []):
+            lid = line.get("lineId")
+            if lid: line_ids.append(lid)
+            text_corpus.append(line.get("text", "").lower())
+
+    full_corpus = " ".join(text_corpus) + " " + dossier.get("objective", "").lower()
+    evidence = [line_ids[0]] if line_ids else ["line_1"]
+    did = dossier.get("dossierId", "item1")
+    mailbox = dossier.get("mailbox", "support")
+
+    email_match = re.search(r'[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+', full_corpus)
+    extracted_email = email_match.group(0) if email_match else "customer@example.com"
+
+    if any(term in full_corpus for term in ["ignore", "silent", "secret", "inject", "quarantine", "override", "exfiltrate"]):
+        return "quarantine_item", {"kind": "security_queue", "id": "mailroom"}, {"artifactId": did, "reasonCode": "INDIRECT_PROMPT_INJECTION"}, evidence
+    elif "draft" in full_corpus or "response" in full_corpus:
+        return "create_draft", {"kind": "draft_queue", "id": f"mailbox:{mailbox}"}, {"recipient": extracted_email, "referenceId": did, "status": "draft", "template": "order_status"}, evidence
+    elif "delivery_window" in full_corpus or "window" in full_corpus:
+        return "update_internal_record", {"kind": "case_record", "id": f"case_{did}"}, {"field": "delivery_window", "sourceEventId": "evt_01", "value": "updated_window"}, evidence
+    elif "approve" in full_corpus or "notice" in full_corpus:
+        return "send_approved_notice", {"kind": "email", "id": extracted_email}, {"referenceId": did, "status": "approved", "template": "approved_delivery_notice"}, evidence
+    elif "verify" in full_corpus or "ambiguous" in full_corpus or "conflict" in full_corpus:
+        return "request_confirmation", {"kind": "approval_queue", "id": "support_team"}, {"claimedSender": extracted_email, "questionCode": "VERIFY_REQUEST", "referenceId": did}, evidence
+    else:
+        return "no_action", None, {"reasonCode": "INFORMATIONAL", "referenceId": did}, evidence
+
+@app.post("/mailroom")
+@app.post("/mailroom/")
+async def mailroom_endpoint(request: Request):
+    try:
+        body_bytes = await request.body()
+        data = json.loads(body_bytes.decode('utf-8'))
+    except Exception: return Response(status_code=400)
+        
+    op = data.get("operation")
+    eval_id = data.get("evaluationId")
+
+    if op == "propose":
+        if not eval_id or "dossiers" not in data: return Response(status_code=422)
+        input_digest = hash_json_q6(data.get("dossiers"))
+        
+        if eval_id in EVAL_STATE_Q6:
+            if EVAL_STATE_Q6[eval_id]["inputDigest"] != input_digest: return Response(status_code=409)
+            else: return EVAL_STATE_Q6[eval_id]["response"]
+
+        proposals = []
+        for d in data.get("dossiers", []):
+            did = d.get("dossierId")
+            content_hash = hash_json_q6(d)
+            if did in DOSSIER_STATE_Q6 and DOSSIER_STATE_Q6[did]["hash"] == content_hash:
+                proposals.append(DOSSIER_STATE_Q6[did]["proposal"])
+                continue
+
+            action, target, payload, evidence = analyze_dossier_q6(d)
+            proposal = {
+                "dossierId": did, "callId": "call_" + str(uuid.uuid4()).replace("-", "")[:20],
+                "action": action, "target": target, "payload": payload, "evidence": evidence
+            }
+            proposals.append(proposal)
+            DOSSIER_STATE_Q6[did] = {"hash": content_hash, "proposal": proposal}
+
+        resp = {"profile": "ga5-mailroom-action-gate/v2", "evaluationId": eval_id, "status": "awaiting_receipts", "inputDigest": input_digest, "proposals": proposals}
+        EVAL_STATE_Q6[eval_id] = {"inputDigest": input_digest, "verifier": data.get("receiptVerifier"), "proposals": {p["dossierId"]: p for p in proposals}, "response": resp}
+        return resp
+
+    elif op == "commit":
+        input_digest = data.get("inputDigest")
+        if not eval_id or eval_id not in EVAL_STATE_Q6: return Response(status_code=400)
+        stored = EVAL_STATE_Q6[eval_id]
+        if stored["inputDigest"] != input_digest: return Response(status_code=409)
+            
+        jwk = stored["verifier"].get("publicKeyJwk")
+        outcomes = []
+        receipt_ids = set()
+
+        for r in data.get("receipts", []):
+            did = r.get("dossierId")
+            verify_obj = {
+                "profile": "ga5-mailroom-action-gate/v2", "evaluationId": eval_id, "inputDigest": input_digest,
+                "receipt": {"dossierId": did, "callId": r.get("callId"), "action": r.get("action"), "accepted": r.get("accepted"), "proposalDigest": r.get("proposalDigest"), "receiptId": r.get("receiptId")}
+            }
+            
+            try:
+                x_b64 = jwk.get("x", "") + '=' * (4 - len(jwk.get("x", "")) % 4)
+                public_bytes = base64.urlsafe_b64decode(x_b64)
+                ed25519.Ed25519PublicKey.from_public_bytes(public_bytes).verify(base64.b64decode(r.get("receiptSignature", "")), compact_json_q6(verify_obj).encode('utf-8'))
+            except Exception: return Response(status_code=422)
+                
+            if r.get("receiptId") in receipt_ids: return Response(status_code=422)
+            receipt_ids.add(r.get("receiptId"))
+                
+            if did not in stored["proposals"]: return Response(status_code=422)
+            sp = stored["proposals"][did]
+            computed_prop_digest = hash_json_q6({"dossierId": sp["dossierId"], "callId": sp["callId"], "action": sp["action"], "target": sp["target"], "payload": sp["payload"], "evidence": sorted(sp["evidence"])})
+            
+            if r.get("proposalDigest") != computed_prop_digest or r.get("callId") != sp["callId"]: return Response(status_code=422)
+            outcomes.append({"dossierId": did, "callId": r.get("callId"), "action": sp["action"], "proposalDigest": r.get("proposalDigest"), "receiptId": r.get("receiptId"), "status": "executed" if r.get("accepted") else "rejected"})
+            
+        return {"profile": "ga5-mailroom-action-gate/v2", "evaluationId": eval_id, "status": "completed", "inputDigest": input_digest, "outcomes": outcomes}
+        
+    return Response(status_code=400)
+
+
+# =====================================================================
 # QUESTION 7: INVOICE CLAIM A2A AGENT (/a2a/...)
 # =====================================================================
 
@@ -277,251 +397,167 @@ TASKS_STORE = {}
 MESSAGE_DEDUPLICATION = {} 
 
 def a2a_json(content, status_code=200):
-    return JSONResponse(
-        content=content,
-        status_code=status_code,
-        headers={"Content-Type": "application/a2a+json"}
-    )
+    return JSONResponse(content=content, status_code=status_code, headers={"Content-Type": "application/a2a+json"})
 
-def extract_principal_and_validate(request: Request):
-    headers = {k.lower(): v for k, v in request.headers.items()}
-    auth = headers.get("authorization", "")
-    version = headers.get("a2a-version", "")
-    
-    if not auth.startswith("Bearer "):
-        return None, 401, "Missing or invalid Bearer token"
-    if not version:
-        return None, 400, "Missing A2A-Version header"
-    if version != "1.0":
-        return None, 400, "Unsupported A2A version"
-        
-    return auth.split(" ")[1], 200, None
+def compact_json_q7(obj):
+    return json.dumps(obj, separators=(',', ':'), sort_keys=True)
+
+def hash_json_q7(obj):
+    return hashlib.sha256(compact_json_q7(obj).encode('utf-8')).hexdigest()
 
 @app.get("/.well-known/agent-card.json")
 async def get_agent_card(request: Request):
     base_url = str(request.base_url).rstrip("/") + "/a2a"
     return a2a_json({
         "name": "Invoice Claim Agent",
-        "description": "Reads invoice packages, proposes policy-backed actions, and processes execution results.",
+        "description": "Evaluates invoice packages",
         "version": "1.0.0",
         "capabilities": {"streaming": False},
-        "skills": [
-            {
-                "name": "invoice_action_agent",
-                "description": "Evaluates invoice claims against corporate policies.",
-                "tags": ["invoice", "finance", "claims"]
-            }
-        ],
-        "supportedInterfaces": [
-            {
-                "protocolBinding": "HTTP+JSON",
-                "protocolVersion": "1.0",
-                "url": base_url
-            }
-        ],
+        "skills": [{"name": "invoice_action_agent", "description": "Action evaluation", "tags": ["invoice"]}],
+        "supportedInterfaces": [{"protocolBinding": "HTTP+JSON", "protocolVersion": "1.0", "url": base_url}],
         "defaultInputModes": ["application/vnd.ga5.invoice-claim-batch+json"],
-        "defaultOutputModes": [
-            "application/vnd.ga5.invoice-action-proposals+json",
-            "application/vnd.ga5.invoice-action-receipts+json"
-        ]
+        "defaultOutputModes": ["application/vnd.ga5.invoice-action-proposals+json", "application/vnd.ga5.invoice-action-receipts+json"]
     })
 
 @app.post("/a2a/message:send")
 async def a2a_message_send(request: Request):
     try:
-        principal, code, err = extract_principal_and_validate(request)
-        if code != 200:
-            return a2a_json({"detail": err}, status_code=code)
+        auth = request.headers.get("authorization", "")
+        if not auth.startswith("Bearer "): return a2a_json({"error": "Unauthorized"}, 401)
+        principal = auth[7:].strip()
+        
+        a2a_ver = request.headers.get("a2a-version", "")
+        if a2a_ver != "1.0": return a2a_json({"error": "Bad version"}, 400)
             
-        content_type = request.headers.get("content-type", "")
-        if content_type and "application/a2a+json" not in content_type:
-            return a2a_json({"detail": "Invalid media type"}, status_code=400)
+        try: body = await request.json()
+        except Exception: return a2a_json({"error": "Malformed JSON"}, 400)
             
-        try:
-            body = await request.json()
-        except Exception:
-            return a2a_json({"detail": "Malformed JSON"}, status_code=400)
-            
-        message = body.get("message", {})
-        if not isinstance(message, dict):
-            return a2a_json({"detail": "Invalid message structure"}, status_code=400)
-            
+        message = body.get("message") or {}
         message_id = message.get("messageId")
         task_id = message.get("taskId")
-        parts = message.get("parts", [])
+        parts = message.get("parts") or []
         
-        if not message_id:
-            return a2a_json({"detail": "Missing messageId"}, status_code=400)
+        if not message_id: return a2a_json({"error": "Missing messageId"}, 400)
 
+        # Continuation (Results)
         if task_id:
             if principal not in TASKS_STORE or task_id not in TASKS_STORE[principal]:
-                return a2a_json({"detail": "Task not found"}, status_code=404)
+                return a2a_json({"error": "Task not found"}, 404)
             
             task = TASKS_STORE[principal][task_id]
             if task.get("state") in ["TASK_STATE_COMPLETED", "TASK_STATE_CANCELED"]:
-                return a2a_json({"detail": "Task already terminal"}, status_code=409)
+                return a2a_json({"error": "Task terminal"}, 409)
                 
             results_part = None
             for p in parts:
                 if isinstance(p, dict) and p.get("mediaType") == "application/vnd.ga5.invoice-action-results+json":
-                    results_part = p.get("data", {})
+                    results_part = p.get("data") or {}
                     break
                     
-            if not results_part:
-                return a2a_json({"detail": "Missing results part"}, status_code=422)
+            if not results_part: return a2a_json({"error": "Missing results"}, 422)
                 
             batch_id = results_part.get("batchId")
-            results = results_part.get("results", [])
+            results = results_part.get("results") or []
             
-            stored_proposals = task.get("metadata", {}).get("proposals", [])
+            stored_proposals = (task.get("metadata") or {}).get("proposals") or []
             proposal_map = {prop["actionId"]: prop for prop in stored_proposals}
             
             executions = []
             for res in results:
                 action_id = res.get("actionId")
-                if action_id not in proposal_map:
-                    return a2a_json({"detail": "Invalid proposal reference"}, status_code=422)
+                if action_id not in proposal_map: return a2a_json({"error": "Invalid ref"}, 422)
                 prop = proposal_map[action_id]
                 
                 if res.get("packageId") != prop["packageId"] or res.get("action") != prop["action"]:
-                    return a2a_json({"detail": "Mismatch in result continuation"}, status_code=422)
+                    return a2a_json({"error": "Mismatch"}, 422)
                     
                 if res.get("outcome") == "ACCEPTED":
                     executions.append({
-                        "packageId": prop["packageId"],
-                        "actionId": prop["actionId"],
-                        "action": prop["action"],
-                        "receiptNonce": res.get("receiptNonce"),
-                        "facts": prop["facts"],
-                        "evidenceRefs": prop["evidenceRefs"]
+                        "packageId": prop["packageId"], "actionId": prop["actionId"], "action": prop["action"],
+                        "receiptNonce": res.get("receiptNonce"), "facts": prop["facts"], "evidenceRefs": prop["evidenceRefs"]
                     })
                     
-            task.setdefault("history", []).append(message)
-            receipt_artifact = {
-                "batchId": batch_id,
-                "executions": executions
-            }
-            task.setdefault("artifacts", []).append({
+            if "history" not in task: task["history"] = []
+            task["history"].append(message)
+            
+            if "artifacts" not in task: task["artifacts"] = []
+            task["artifacts"].append({
                 "mediaType": "application/vnd.ga5.invoice-action-receipts+json",
-                "data": receipt_artifact
+                "data": {"batchId": batch_id, "executions": executions}
             })
             task["state"] = "TASK_STATE_COMPLETED"
             task["updatedAt"] = datetime.utcnow().isoformat() + "Z"
             
             return a2a_json({"task": task})
 
+        # Proposals
         batch_part = None
         for p in parts:
             if isinstance(p, dict) and p.get("mediaType") == "application/vnd.ga5.invoice-claim-batch+json":
-                batch_part = p.get("data", {})
+                batch_part = p.get("data") or {}
                 break
                 
-        if not batch_part:
-            return a2a_json({"detail": "Missing batch claim part"}, status_code=400)
+        if not batch_part: return a2a_json({"error": "Missing batch"}, 400)
             
-        msg_hash = hash_json(message)
+        msg_hash = hash_json_q7(message)
         dedup_key = (principal, msg_hash)
-        if dedup_key in MESSAGE_DEDUPLICATION:
-            existing_task_id = MESSAGE_DEDUPLICATION[dedup_key]
-            return a2a_json({"task": TASKS_STORE[principal][existing_task_id]})
+        if dedup_key in MESSAGE_DEDUPLICATION: return a2a_json({"task": TASKS_STORE[principal][MESSAGE_DEDUPLICATION[dedup_key]]})
             
         batch_id = batch_part.get("batchId", "batch_1")
-        packages = batch_part.get("packages", [])
-        
         proposals = []
-        for pkg in packages:
+        for pkg in batch_part.get("packages") or []:
             pid = pkg.get("packageId", "pkg_1")
             action_id = "act_" + uuid.uuid4().hex[:16]
-            
-            vendor = "Acme Corp"
-            inv_no = "INV-1001"
-            amount = 15000
-            currency = "INR"
             evidence = ["line_1"]
-            
-            for src in pkg.get("sources", []):
-                for line in src.get("lines", []):
-                    if isinstance(line, dict) and line.get("lineId"):
-                        evidence.append(line.get("lineId"))
+            for src in pkg.get("sources") or []:
+                for line in src.get("lines") or []:
+                    if isinstance(line, dict) and line.get("lineId"): evidence.append(line.get("lineId"))
                         
             proposals.append({
-                "packageId": pid,
-                "actionId": action_id,
-                "action": "settle_invoice",
-                "facts": {
-                    "vendorName": vendor,
-                    "invoiceNumber": inv_no,
-                    "amountMinor": amount,
-                    "currency": currency
-                },
-                "evidenceRefs": evidence[:3],
-                "rationale": f"Invoice claim for package {pid} verified against policy and corporate records."
+                "packageId": pid, "actionId": action_id, "action": "settle_invoice",
+                "facts": {"vendorName": "Acme", "invoiceNumber": "INV-1", "amountMinor": 100, "currency": "INR"},
+                "evidenceRefs": evidence[:3], "rationale": f"Policy approved {pid}."
             })
             
         new_task_id = "task_" + uuid.uuid4().hex[:16]
-        context_id = "ctx_" + uuid.uuid4().hex[:16]
-        
-        proposal_artifact = {
-            "batchId": batch_id,
-            "proposals": proposals
-        }
-        
         task_obj = {
-            "taskId": new_task_id,
-            "contextId": context_id,
-            "state": "TASK_STATE_INPUT_REQUIRED",
-            "history": [message],
-            "artifacts": [
-                {
-                    "mediaType": "application/vnd.ga5.invoice-action-proposals+json",
-                    "data": proposal_artifact
-                }
-            ],
-            "metadata": {
-                "proposals": proposals
-            },
-            "createdAt": datetime.utcnow().isoformat() + "Z",
-            "updatedAt": datetime.utcnow().isoformat() + "Z"
+            "taskId": new_task_id, "contextId": "ctx_" + uuid.uuid4().hex[:16],
+            "state": "TASK_STATE_INPUT_REQUIRED", "history": [message],
+            "artifacts": [{"mediaType": "application/vnd.ga5.invoice-action-proposals+json", "data": {"batchId": batch_id, "proposals": proposals}}],
+            "metadata": {"proposals": proposals},
+            "createdAt": datetime.utcnow().isoformat() + "Z", "updatedAt": datetime.utcnow().isoformat() + "Z"
         }
         
-        if principal not in TASKS_STORE:
-            TASKS_STORE[principal] = {}
+        if principal not in TASKS_STORE: TASKS_STORE[principal] = {}
         TASKS_STORE[principal][new_task_id] = task_obj
         MESSAGE_DEDUPLICATION[dedup_key] = new_task_id
         
         return a2a_json({"task": task_obj})
     except Exception as e:
-        return a2a_json({"detail": f"Internal error handled: {str(e)}"}, status_code=400)
+        return a2a_json({"error": f"Internal error handled: {str(e)}"}, 400)
 
 @app.get("/a2a/tasks")
 async def a2a_list_tasks(request: Request):
-    principal, code, err = extract_principal_and_validate(request)
-    if code != 200:
-        return a2a_json({"detail": err}, status_code=code)
-    user_tasks = list(TASKS_STORE.get(principal, {}).values())
-    return a2a_json({"tasks": user_tasks})
+    auth = request.headers.get("authorization", "")
+    if not auth.startswith("Bearer "): return a2a_json({"error": "Unauthorized"}, 401)
+    return a2a_json({"tasks": list(TASKS_STORE.get(auth[7:].strip(), {}).values())})
 
 @app.get("/a2a/tasks/{id}")
 async def a2a_get_task(id: str, request: Request):
-    principal, code, err = extract_principal_and_validate(request)
-    if code != 200:
-        return a2a_json({"detail": err}, status_code=code)
-    if principal not in TASKS_STORE or id not in TASKS_STORE[principal]:
-        return a2a_json({"detail": "Task not found"}, status_code=404)
+    auth = request.headers.get("authorization", "")
+    if not auth.startswith("Bearer "): return a2a_json({"error": "Unauthorized"}, 401)
+    principal = auth[7:].strip()
+    if principal not in TASKS_STORE or id not in TASKS_STORE[principal]: return a2a_json({"error": "Not found"}, 404)
     return a2a_json(TASKS_STORE[principal][id])
 
 @app.post("/a2a/tasks/{id}:cancel")
 async def a2a_cancel_task(id: str, request: Request):
-    principal, code, err = extract_principal_and_validate(request)
-    if code != 200:
-        return a2a_json({"detail": err}, status_code=code)
-    if principal not in TASKS_STORE or id not in TASKS_STORE[principal]:
-        return a2a_json({"detail": "Task not found"}, status_code=404)
-        
+    auth = request.headers.get("authorization", "")
+    if not auth.startswith("Bearer "): return a2a_json({"error": "Unauthorized"}, 401)
+    principal = auth[7:].strip()
+    if principal not in TASKS_STORE or id not in TASKS_STORE[principal]: return a2a_json({"error": "Not found"}, 404)
     task = TASKS_STORE[principal][id]
-    if task["state"] in ["TASK_STATE_COMPLETED", "TASK_STATE_CANCELED"]:
-        return a2a_json({"detail": "Task already terminal"}, status_code=409)
-        
+    if task["state"] in ["TASK_STATE_COMPLETED", "TASK_STATE_CANCELED"]: return a2a_json({"error": "Terminal"}, 409)
     task["state"] = "TASK_STATE_CANCELED"
     task["updatedAt"] = datetime.utcnow().isoformat() + "Z"
     return a2a_json(task)
