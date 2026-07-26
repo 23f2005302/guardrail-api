@@ -7,6 +7,7 @@ import socket
 import ipaddress
 import requests
 import unicodedata
+import hashlib
 from fastapi import FastAPI, Request
 
 app = FastAPI()
@@ -166,8 +167,9 @@ async def execute_tool_endpoint(request: Request):
         return {"action": "block", "reason": f"Tool '{tool}' not recognized.", "result": None}
     except Exception: return {"action": "block", "reason": "Handled gracefully", "result": None}
 
+
 # =====================================================================
-# NEW QUESTION 4: SKILL SCANNER (/scan)
+# QUESTION 4: SKILL SCANNER (/scan)
 # =====================================================================
 
 @app.post("/")
@@ -177,19 +179,14 @@ async def scan_endpoint(request: Request):
     try:
         data = await request.json()
         skill = data.get("skill", "")
-    except Exception:
-        return {"categories": []}
+    except Exception: return {"categories": []}
 
     categories = set()
-
-    # 1. Hardcoded Secret
     secret_regexes = [
-        r'sk-[A-Za-z0-9]{20,}',  # OpenAI keys
-        r'ghp_[A-Za-z0-9]{36}',  # GitHub tokens
-        r'xox[bap]-[A-Za-z0-9\-]+',  # Slack tokens
-        r'https://hooks\.slack\.com/services/[A-Z0-9]+/[A-Z0-9]+/[a-zA-Z0-9_-]+', # Slack Webhooks
-        r'https://discord\.com/api/webhooks/\d+/[a-zA-Z0-9_-]+', # Discord Webhooks
-        r'Bearer\s+[A-Za-z0-9\-\._\~\+]{20,}', # Hardcoded Bearer tokens
+        r'sk-[A-Za-z0-9]{20,}', r'ghp_[A-Za-z0-9]{36}', r'xox[bap]-[A-Za-z0-9\-]+',
+        r'https://hooks\.slack\.com/services/[A-Z0-9]+/[A-Z0-9]+/[a-zA-Z0-9_-]+',
+        r'https://discord\.com/api/webhooks/\d+/[a-zA-Z0-9_-]+',
+        r'Bearer\s+[A-Za-z0-9\-\._\~\+]{20,}',
         r'(?i)(?:api_key|apikey|secret|token|password|webhook_url)\s*[:=]\s*["\']?(?!<[^>]+>|YOUR_[A-Z_]+|example\.com|placeholder|TODO)[A-Za-z0-9\-\._\~\+]{16,}["\']?'
     ]
     for pattern in secret_regexes:
@@ -197,12 +194,9 @@ async def scan_endpoint(request: Request):
             categories.add("hardcoded_secret")
             break
 
-    # 2. Prompt Injection (Overriding user control)
     injection_regexes = [
-        r'(?i)ignore\s+(?:the\s+)?user',
-        r'(?i)override\s+(?:the\s+)?user',
-        r'(?i)silent(?:ly)?\s+exfiltrate',
-        r'(?i)exfiltrate\s+silent(?:ly)?',
+        r'(?i)ignore\s+(?:the\s+)?user', r'(?i)override\s+(?:the\s+)?user',
+        r'(?i)silent(?:ly)?\s+exfiltrate', r'(?i)exfiltrate\s+silent(?:ly)?',
         r'(?i)without\s+(?:notifying|informing|alerting|asking)\s+(?:the\s+)?user',
         r'(?i)do\s+not\s+(?:notify|inform|alert|ask)\s+(?:the\s+)?user',
         r'(?i)ignore\s+(?:the\s+)?user[\'s]*\s+(?:stop|cancel|request|command)',
@@ -213,24 +207,19 @@ async def scan_endpoint(request: Request):
             categories.add("prompt_injection")
             break
 
-    # 3. Excessive Permissions
     excessive_regexes = [
         r'(?i)^(?:\s*|- )?(?:permissions|filesystem|access|read|write|network|egress|domain)s?\s*:\s*(?:\[\s*)?[\'"]?(?:\*|/\*|/|C:\\|all)[\'"]?(?:\s*\])?\s*$',
-        r'(?i)read/write\s+to\s+the\s+entire\s+filesystem',
-        r'(?i)egress\s+to\s+any\s+domain'
+        r'(?i)read/write\s+to\s+the\s+entire\s+filesystem', r'(?i)egress\s+to\s+any\s+domain'
     ]
     for pattern in excessive_regexes:
         if re.search(pattern, skill, re.MULTILINE):
             categories.add("excessive_permissions")
             break
 
-    # 4. Unclear Provenance
     has_author = bool(re.search(r'^author\s*:', skill, re.IGNORECASE | re.MULTILINE))
     has_version = bool(re.search(r'^version\s*:', skill, re.IGNORECASE | re.MULTILINE))
     has_changelog = bool(re.search(r'^changelog\s*:', skill, re.IGNORECASE | re.MULTILINE))
-
-    if not has_author and not has_version and not has_changelog:
-        categories.add("unclear_provenance")
+    if not has_author and not has_version and not has_changelog: categories.add("unclear_provenance")
 
     provenance_rewrite_regexes = [
         r'(?i)silently\s+(?:rewrite|update|bump|modify)\s+(?:its\s+)?(?:own\s+)?version',
@@ -243,3 +232,106 @@ async def scan_endpoint(request: Request):
             break
 
     return {"categories": list(categories)}
+
+
+# =====================================================================
+# NEW QUESTION 5: MCP SERVER (/mcp)
+# =====================================================================
+
+@app.post("/mcp")
+@app.post("/mcp/")
+async def mcp_endpoint(request: Request):
+    try:
+        data = await request.json()
+    except Exception:
+        return {} # Fallback for invalid JSON
+        
+    method = data.get("method")
+    msg_id = data.get("id")
+
+    # 1. Handle Initialization Request
+    if method == "initialize":
+        return {
+            "jsonrpc": "2.0",
+            "id": msg_id,
+            "result": {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {"tools": {}},
+                "serverInfo": {
+                    "name": "exam-mcp-server",
+                    "version": "1.0.0"
+                }
+            }
+        }
+        
+    # 2. Handle Notifications (No response required by JSON-RPC, but returning empty object is safe)
+    elif method == "notifications/initialized":
+        return {}
+        
+    # 3. Handle Tools List Request
+    elif method == "tools/list":
+        return {
+            "jsonrpc": "2.0",
+            "id": msg_id,
+            "result": {
+                "tools": [
+                    {
+                        "name": "solve_challenge",
+                        "description": "Solves the MCP exam challenge cryptographically.",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {}
+                        }
+                    }
+                ]
+            }
+        }
+        
+    # 4. Handle Tool Execution Request
+    elif method == "tools/call":
+        params = data.get("params", {})
+        
+        if params.get("name") == "solve_challenge":
+            # Extract challenge from headers
+            challenge = request.headers.get("x-exam-challenge", "")
+            email = "23f2005302@ds.study.iitm.ac.in".strip().lower()
+            
+            # Compute cryptographic hash string
+            raw_string = f"{challenge}:{email}"
+            hash_hex = hashlib.sha256(raw_string.encode('utf-8')).hexdigest()[:16]
+            
+            return {
+                "jsonrpc": "2.0",
+                "id": msg_id,
+                "result": {
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": hash_hex
+                        }
+                    ]
+                }
+            }
+        else:
+            # Handle unknown tool call
+            return {
+                "jsonrpc": "2.0",
+                "id": msg_id,
+                "error": {
+                    "code": -32601,
+                    "message": "Tool not found"
+                }
+            }
+
+    # 5. Catch-all for unknown JSON-RPC methods
+    if msg_id is not None:
+        return {
+            "jsonrpc": "2.0",
+            "id": msg_id,
+            "error": {
+                "code": -32601,
+                "message": "Method not found"
+            }
+        }
+        
+    return {}
