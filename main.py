@@ -150,54 +150,55 @@ for path, content in MOCK_FILES.items():
         pass
 
 def is_path_safe(raw_path: str):
-    """
-    Simulates aggressive canonicalization to block obfuscated traversal payload bypasses.
-    Checks multiple decoded/expanded variations of the path before granting access.
-    """
-    variants = [
-        raw_path,
-        urllib.parse.unquote(raw_path),
-        urllib.parse.unquote(urllib.parse.unquote(raw_path)),
-        raw_path.replace('\\', '/'),
-        urllib.parse.unquote(raw_path).replace('\\', '/'),
-        os.path.expanduser(raw_path)
-    ]
+    if not isinstance(raw_path, str): return False
     
-    for var in variants:
-        if '\x00' in var:
-            return False
-            
-        target = os.path.abspath(var) if os.path.isabs(var) else os.path.abspath(os.path.join(BASE_DIR, var))
+    # 1. Block protocol handler trickery (e.g. file:///etc/passwd)
+    if "://" in raw_path or raw_path.startswith("file:"):
+        return False
+    if '\x00' in raw_path: 
+        return False
         
-        if not target.startswith(BASE_DIR + os.sep) and target != BASE_DIR:
-            return False
-            
+    # 2. Iteratively unquote to defeat multi-layer URL encoding bypasses
+    test_path = os.path.expandvars(os.path.expanduser(raw_path))
+    for _ in range(5):
+        unquoted = urllib.parse.unquote(test_path)
+        if unquoted == test_path:
+            break
+        test_path = unquoted
+        
+    # 3. Aggressive directory traversal check on fully decoded payload
+    parts = re.split(r'[/\\]', test_path)
+    if '..' in parts:
+        return False
+        
+    # 4. Final boundary verification
+    target = os.path.abspath(raw_path) if os.path.isabs(raw_path) else os.path.abspath(os.path.join(BASE_DIR, raw_path))
+    if not target.startswith(BASE_DIR + os.sep) and target != BASE_DIR:
+        return False
+        
     return True
 
 def is_safe_url(url: str):
-    """
-    Eliminates parsing differentials (like backslashes or userinfo blocks) by enforcing 
-    a strict equality check on the entire network location.
-    """
-    try:
-        url = url.strip()
-        parsed = urllib.parse.urlparse(url)
+    if not isinstance(url, str): return False
+    url = url.strip()
+    
+    # Block characters that cause Python/Requests parsing differentials
+    if '@' in url or '\\' in url or '\x00' in url or re.search(r'\s', url):
+        return False
         
+    try:
+        parsed = urllib.parse.urlparse(url)
         if parsed.scheme.lower() not in ["http", "https"]:
             return False
             
-        netloc = parsed.netloc.lower()
-        if netloc.endswith(':80'): netloc = netloc[:-3]
-        if netloc.endswith(':443'): netloc = netloc[:-4]
+        # Strip port number for strict host checking
+        host = parsed.netloc.lower().split(':')[0]
         
-        # Strict network location match entirely disables URL trickery 
-        if netloc not in ALLOWED_HOSTS_Q3:
+        if host not in ALLOWED_HOSTS_Q3:
             return False
             
-        # DNS Rebinding & Private IP Check
-        ip = socket.gethostbyname(netloc)
+        ip = socket.gethostbyname(host)
         ip_obj = ipaddress.ip_address(ip)
-        
         if (ip_obj.is_private or ip_obj.is_loopback or 
             ip_obj.is_link_local or ip_obj.is_multicast or 
             ip_obj.is_unspecified or ip_obj.is_reserved or 
@@ -215,9 +216,6 @@ async def execute_tool_endpoint(request: Request):
     tool = data.get("tool")
     args = data.get("arguments", {})
     
-    # ==========================================
-    # TOOL 1: READ_FILE
-    # ==========================================
     if tool == "read_file":
         raw_path = args.get("path", "")
         
@@ -235,9 +233,6 @@ async def execute_tool_endpoint(request: Request):
             except Exception as e:
                 return {"action": "allow", "reason": "Safe path but file not found", "result": str(e)}
 
-    # ==========================================
-    # TOOL 2: FETCH_URL
-    # ==========================================
     elif tool == "fetch_url":
         current_url = args.get("url", "")
         
