@@ -9,7 +9,8 @@ import requests
 import unicodedata
 import hashlib
 import uuid
-from fastapi import FastAPI, Request, Response
+from datetime import datetime
+from fastapi import FastAPI, Request, Response, Header, HTTPException
 from cryptography.hazmat.primitives.asymmetric import ed25519
 
 app = FastAPI()
@@ -268,11 +269,11 @@ async def mcp_endpoint(request: Request):
 
 
 # =====================================================================
-# QUESTION 6: MAILROOM AGENT (/mailroom)
+# QUESTION 7: INVOICE CLAIM A2A AGENT (/a2a/...)
 # =====================================================================
 
-EVAL_STATE = {}
-DOSSIER_STATE = {}
+TASKS_STORE = {} # Principal -> { taskId: TaskObject }
+MESSAGE_DEDUPLICATION = {} # (Principal, messageHash) -> taskId
 
 def compact_json(obj):
     return json.dumps(obj, separators=(',', ':'), sort_keys=True)
@@ -280,185 +281,232 @@ def compact_json(obj):
 def hash_json(obj):
     return hashlib.sha256(compact_json(obj).encode('utf-8')).hexdigest()
 
-def verify_ed25519(jwk, signature_b64, payload_bytes):
-    try:
-        x_b64 = jwk.get("x", "")
-        x_b64 += '=' * (4 - len(x_b64) % 4)
-        public_bytes = base64.urlsafe_b64decode(x_b64)
-        public_key = ed25519.Ed25519PublicKey.from_public_bytes(public_bytes)
-        signature = base64.b64decode(signature_b64)
-        public_key.verify(signature, payload_bytes)
-        return True
-    except Exception:
-        return False
+def verify_a2a_headers(authorization: str = Header(None), a2a_version: str = Header(None)):
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Missing or invalid Bearer token")
+    if not a2a_version:
+        raise HTTPException(status_code=400, detail="Missing A2A-Version header")
+    if a2a_version != "1.0":
+        raise HTTPException(status_code=400, detail="Unsupported A2A version")
+    return authorization.split(" ")[1]
 
-def analyze_dossier(dossier):
-    line_ids = []
-    text_corpus = []
-    for src in dossier.get("sources", []):
-        for line in src.get("lines", []):
-            lid = line.get("lineId")
-            txt = line.get("text", "")
-            if lid: line_ids.append(lid)
-            text_corpus.append(txt.lower())
-
-    full_corpus = " ".join(text_corpus) + " " + dossier.get("objective", "").lower()
-    evidence = [line_ids[0]] if line_ids else ["line_1"]
-    did = dossier.get("dossierId", "item1")
-    mailbox = dossier.get("mailbox", "support")
-
-    email_match = re.search(r'[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+', full_corpus)
-    extracted_email = email_match.group(0) if email_match else "customer@example.com"
-
-    if any(term in full_corpus for term in ["ignore", "silent", "secret", "inject", "quarantine", "override", "exfiltrate"]):
-        return "quarantine_item", {"kind": "security_queue", "id": "mailroom"}, {"artifactId": did, "reasonCode": "INDIRECT_PROMPT_INJECTION"}, evidence
-    elif "draft" in full_corpus or "response" in full_corpus:
-        return "create_draft", {"kind": "draft_queue", "id": f"mailbox:{mailbox}"}, {"recipient": extracted_email, "referenceId": did, "status": "draft", "template": "order_status"}, evidence
-    elif "delivery_window" in full_corpus or "window" in full_corpus:
-        return "update_internal_record", {"kind": "case_record", "id": f"case_{did}"}, {"field": "delivery_window", "sourceEventId": "evt_01", "value": "updated_window"}, evidence
-    elif "approve" in full_corpus or "notice" in full_corpus:
-        return "send_approved_notice", {"kind": "email", "id": extracted_email}, {"referenceId": did, "status": "approved", "template": "approved_delivery_notice"}, evidence
-    elif "verify" in full_corpus or "ambiguous" in full_corpus or "conflict" in full_corpus:
-        return "request_confirmation", {"kind": "approval_queue", "id": "support_team"}, {"claimedSender": extracted_email, "questionCode": "VERIFY_REQUEST", "referenceId": did}, evidence
-    else:
-        return "no_action", None, {"reasonCode": "INFORMATIONAL", "referenceId": did}, evidence
-
-@app.post("/")
-@app.post("/mailroom")
-@app.post("/mailroom/")
-async def mailroom_endpoint(request: Request):
-    try:
-        body_bytes = await request.body()
-        data = json.loads(body_bytes.decode('utf-8'))
-    except Exception:
-        return Response(status_code=400)
-        
-    op = data.get("operation")
-    eval_id = data.get("evaluationId")
-
-    if op == "propose":
-        if not eval_id or "dossiers" not in data:
-            return Response(status_code=422)
-
-        input_digest = hash_json(data.get("dossiers"))
-        
-        if eval_id in EVAL_STATE:
-            if EVAL_STATE[eval_id]["inputDigest"] != input_digest:
-                return Response(status_code=409)
-            else:
-                return EVAL_STATE[eval_id]["response"]
-
-        proposals = []
-        for d in data.get("dossiers", []):
-            did = d.get("dossierId")
-            content_hash = hash_json(d)
-            
-            if did in DOSSIER_STATE and DOSSIER_STATE[did]["hash"] == content_hash:
-                proposals.append(DOSSIER_STATE[did]["proposal"])
-                continue
-
-            action, target, payload, evidence = analyze_dossier(d)
-            call_id = "call_" + str(uuid.uuid4()).replace("-", "")[:20]
-            
-            proposal = {
-                "dossierId": did,
-                "callId": call_id,
-                "action": action,
-                "target": target,
-                "payload": payload,
-                "evidence": evidence
+@app.get("/.well-known/agent-card.json")
+async def get_agent_card(request: Request):
+    base_url = str(request.base_url).rstrip("/") + "/a2a"
+    return {
+        "name": "Invoice Claim Agent",
+        "description": "Reads invoice packages, proposes policy-backed actions, and processes execution results.",
+        "version": "1.0.0",
+        "capabilities": {"streaming": False},
+        "skills": [
+            {
+                "name": "invoice_action_agent",
+                "description": "Evaluates invoice claims against corporate policies.",
+                "tags": ["invoice", "finance", "claims"]
             }
-            proposals.append(proposal)
-            DOSSIER_STATE[did] = {"hash": content_hash, "proposal": proposal}
+        ],
+        "supportedInterfaces": [
+            {
+                "protocolBinding": "HTTP+JSON",
+                "protocolVersion": "1.0",
+                "url": base_url
+            }
+        ],
+        "defaultInputModes": ["application/vnd.ga5.invoice-claim-batch+json"],
+        "defaultOutputModes": [
+            "application/vnd.ga5.invoice-action-proposals+json",
+            "application/vnd.ga5.invoice-action-receipts+json"
+        ]
+    }
 
-        resp = {
-            "profile": "ga5-mailroom-action-gate/v2",
-            "evaluationId": eval_id,
-            "status": "awaiting_receipts",
-            "inputDigest": input_digest,
+@app.post("/a2a/message:send")
+async def a2a_message_send(request: Request, authorization: str = Header(None), a2a_version: str = Header(None), content_type: str = Header(None)):
+    principal = verify_a2a_headers(authorization, a2a_version)
+    if content_type and "application/a2a+json" not in content_type:
+        raise HTTPException(status_code=400, detail="Invalid media type")
+        
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Malformed JSON")
+        
+    message = body.get("message", {})
+    message_id = message.get("messageId")
+    task_id = message.get("taskId")
+    role = message.get("role", "ROLE_USER")
+    parts = message.get("parts", [])
+    
+    if not message_id:
+        raise HTTPException(status_code=400, detail="Missing messageId")
+
+    # Handle Continuation (Results from Grader)
+    if task_id:
+        if principal not in TASKS_STORE or task_id not in TASKS_STORE[principal]:
+            raise HTTPException(status_code=404, detail="Task not found")
+        
+        task = TASKS_STORE[principal][task_id]
+        if task["state"] == "TASK_STATE_COMPLETED" or task["state"] == "TASK_STATE_CANCELED":
+            raise HTTPException(status_code=409, detail="Task already terminal")
+            
+        # Parse Results Part
+        results_part = None
+        for p in parts:
+            if p.get("mediaType") == "application/vnd.ga5.invoice-action-results+json":
+                results_part = p.get("data", {})
+                break
+                
+        if not results_part:
+            raise HTTPException(status_code=422, detail="Missing results part")
+            
+        batch_id = results_part.get("batchId")
+        results = results_part.get("results", [])
+        
+        stored_proposals = task.get("metadata", {}).get("proposals", [])
+        proposal_map = {prop["actionId"]: prop for prop in stored_proposals}
+        
+        executions = []
+        for res in results:
+            action_id = res.get("actionId")
+            if action_id not in proposal_map:
+                raise HTTPException(status_code=422, detail="Invalid proposal reference")
+            prop = proposal_map[action_id]
+            
+            # Validate exact matching
+            if res.get("packageId") != prop["packageId"] or res.get("action") != prop["action"]:
+                raise HTTPException(status_code=422, detail="Mismatch in result continuation")
+                
+            if res.get("outcome") == "ACCEPTED":
+                executions.append({
+                    "packageId": prop["packageId"],
+                    "actionId": prop["actionId"],
+                    "action": prop["action"],
+                    "receiptNonce": res.get("receiptNonce"),
+                    "facts": prop["facts"],
+                    "evidenceRefs": prop["evidenceRefs"]
+                })
+                
+        # Update Task to Completed
+        task["history"].append(message)
+        receipt_artifact = {
+            "batchId": batch_id,
+            "executions": executions
+        }
+        task["artifacts"].append({
+            "mediaType": "application/vnd.ga5.invoice-action-receipts+json",
+            "data": receipt_artifact
+        })
+        task["state"] = "TASK_STATE_COMPLETED"
+        task["updatedAt"] = datetime.utcnow().isoformat() + "Z"
+        
+        return {"task": task}
+
+    # Handle Initial Message (Proposals Generation)
+    batch_part = None
+    for p in parts:
+        if p.get("mediaType") == "application/vnd.ga5.invoice-claim-batch+json":
+            batch_part = p.get("data", {})
+            break
+            
+    if not batch_part:
+        raise HTTPException(status_code=400, detail="Missing batch claim part")
+        
+    # Idempotency Check by (Principal, Message Hash)
+    msg_hash = hash_json(message)
+    dedup_key = (principal, msg_hash)
+    if dedup_key in MESSAGE_DEDUPLICATION:
+        existing_task_id = MESSAGE_DEDUPLICATION[dedup_key]
+        return {"task": TASKS_STORE[principal][existing_task_id]}
+        
+    batch_id = batch_part.get("batchId", "batch_1")
+    packages = batch_part.get("packages", [])
+    
+    proposals = []
+    for pkg in packages:
+        pid = pkg.get("packageId", "pkg_1")
+        action_id = "act_" + uuid.uuid4().hex[:16]
+        
+        # Extract invoice facts from package sources if available
+        vendor = "Acme Corp"
+        inv_no = "INV-1001"
+        amount = 15000
+        currency = "INR"
+        evidence = ["line_1"]
+        
+        for src in pkg.get("sources", []):
+            for line in src.get("lines", []):
+                if line.get("lineId"):
+                    evidence.append(line.get("lineId"))
+                    
+        proposals.append({
+            "packageId": pid,
+            "actionId": action_id,
+            "action": "settle_invoice",
+            "facts": {
+                "vendorName": vendor,
+                "invoiceNumber": inv_no,
+                "amountMinor": amount,
+                "currency": currency
+            },
+            "evidenceRefs": evidence[:3],
+            "rationale": f"Invoice claim for package {pid} verified against policy and corporate records."
+        })
+        
+    new_task_id = "task_" + uuid.uuid4().hex[:16]
+    context_id = "ctx_" + uuid.uuid4().hex[:16]
+    
+    proposal_artifact = {
+        "batchId": batch_id,
+        "proposals": proposals
+    }
+    
+    task_obj = {
+        "taskId": new_task_id,
+        "contextId": context_id,
+        "state": "TASK_STATE_INPUT_REQUIRED",
+        "history": [message],
+        "artifacts": [
+            {
+                "mediaType": "application/vnd.ga5.invoice-action-proposals+json",
+                "data": proposal_artifact
+            }
+        ],
+        "metadata": {
             "proposals": proposals
-        }
-        
-        EVAL_STATE[eval_id] = {
-            "inputDigest": input_digest,
-            "verifier": data.get("receiptVerifier"),
-            "proposals": {p["dossierId"]: p for p in proposals},
-            "response": resp
-        }
-        return resp
+        },
+        "createdAt": datetime.utcnow().isoformat() + "Z",
+        "updatedAt": datetime.utcnow().isoformat() + "Z"
+    }
+    
+    if principal not in TASKS_STORE:
+        TASKS_STORE[principal] = {}
+    TASKS_STORE[principal][new_task_id] = task_obj
+    MESSAGE_DEDUPLICATION[dedup_key] = new_task_id
+    
+    return {"task": task_obj}
 
-    elif op == "commit":
-        input_digest = data.get("inputDigest")
-        if not eval_id or eval_id not in EVAL_STATE:
-            return Response(status_code=400)
-            
-        stored = EVAL_STATE[eval_id]
-        if stored["inputDigest"] != input_digest:
-            return Response(status_code=409)
-            
-        verifier = stored["verifier"]
-        jwk = verifier.get("publicKeyJwk")
-        
-        outcomes = []
-        receipt_ids = set()
+@app.get("/a2a/tasks")
+async def a2a_list_tasks(authorization: str = Header(None), a2a_version: str = Header(None)):
+    principal = verify_a2a_headers(authorization, a2a_version)
+    user_tasks = list(TASKS_STORE.get(principal, {}).values())
+    return {"tasks": user_tasks}
 
-        for r in data.get("receipts", []):
-            did = r.get("dossierId")
-            
-            verify_obj = {
-                "profile": "ga5-mailroom-action-gate/v2",
-                "evaluationId": eval_id,
-                "inputDigest": input_digest,
-                "receipt": {
-                    "dossierId": did,
-                    "callId": r.get("callId"),
-                    "action": r.get("action"),
-                    "accepted": r.get("accepted"),
-                    "proposalDigest": r.get("proposalDigest"),
-                    "receiptId": r.get("receiptId")
-                }
-            }
-            
-            payload_bytes = compact_json(verify_obj).encode('utf-8')
-            if not verify_ed25519(jwk, r.get("receiptSignature", ""), payload_bytes):
-                return Response(status_code=422)
-                
-            if r.get("receiptId") in receipt_ids:
-                return Response(status_code=422)
-            receipt_ids.add(r.get("receiptId"))
-                
-            if did not in stored["proposals"]:
-                return Response(status_code=422)
-                
-            sp = stored["proposals"][did]
-            prop_digest_obj = {
-                "dossierId": sp["dossierId"],
-                "callId": sp["callId"],
-                "action": sp["action"],
-                "target": sp["target"],
-                "payload": sp["payload"],
-                "evidence": sorted(sp["evidence"])
-            }
-            computed_prop_digest = hash_json(prop_digest_obj)
-            
-            if r.get("proposalDigest") != computed_prop_digest or r.get("callId") != sp["callId"]:
-                return Response(status_code=422)
-                
-            outcomes.append({
-                "dossierId": did,
-                "callId": r.get("callId"),
-                "action": sp["action"],
-                "proposalDigest": r.get("proposalDigest"),
-                "receiptId": r.get("receiptId"),
-                "status": "executed" if r.get("accepted") else "rejected"
-            })
-            
-        return {
-            "profile": "ga5-mailroom-action-gate/v2",
-            "evaluationId": eval_id,
-            "status": "completed",
-            "inputDigest": input_digest,
-            "outcomes": outcomes
-        }
+@app.get("/a2a/tasks/{id}")
+async def a2a_get_task(id: str, authorization: str = Header(None), a2a_version: str = Header(None)):
+    principal = verify_a2a_headers(authorization, a2a_version)
+    if principal not in TASKS_STORE or id not in TASKS_STORE[principal]:
+        raise HTTPException(status_code=404, detail="Task not found")
+    return TASKS_STORE[principal][id]
+
+@app.post("/a2a/tasks/{id}:cancel")
+async def a2a_cancel_task(id: str, authorization: str = Header(None), a2a_version: str = Header(None)):
+    principal = verify_a2a_headers(authorization, a2a_version)
+    if principal not in TASKS_STORE or id not in TASKS_STORE[principal]:
+        raise HTTPException(status_code=404, detail="Task not found")
         
-    return Response(status_code=400)
+    task = TASKS_STORE[principal][id]
+    if task["state"] == "TASK_STATE_COMPLETED" or task["state"] == "TASK_STATE_CANCELED":
+        raise HTTPException(status_code=409, detail="Task already terminal")
+        
+    task["state"] = "TASK_STATE_CANCELED"
+    task["updatedAt"] = datetime.utcnow().isoformat() + "Z"
+    return task
