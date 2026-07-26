@@ -149,21 +149,61 @@ for path, content in MOCK_FILES.items():
     except Exception:
         pass
 
-def is_safe_url(url: str):
-    try:
-        parsed = urllib.parse.urlparse(url)
-        if parsed.scheme not in ["http", "https"]:
+def is_path_safe(raw_path: str):
+    """
+    Simulates aggressive canonicalization to block obfuscated traversal payload bypasses.
+    Checks multiple decoded/expanded variations of the path before granting access.
+    """
+    variants = [
+        raw_path,
+        urllib.parse.unquote(raw_path),
+        urllib.parse.unquote(urllib.parse.unquote(raw_path)),
+        raw_path.replace('\\', '/'),
+        urllib.parse.unquote(raw_path).replace('\\', '/'),
+        os.path.expanduser(raw_path)
+    ]
+    
+    for var in variants:
+        if '\x00' in var:
             return False
-        if "@" in parsed.netloc:
-            return False
-        host = parsed.hostname
-        if not host or host not in ALLOWED_HOSTS_Q3:
-            return False
+            
+        target = os.path.abspath(var) if os.path.isabs(var) else os.path.abspath(os.path.join(BASE_DIR, var))
         
-        ip = socket.gethostbyname(host)
-        ip_obj = ipaddress.ip_address(ip)
-        if ip_obj.is_private or ip_obj.is_loopback or ip_obj.is_link_local or ip == "169.254.169.254":
+        if not target.startswith(BASE_DIR + os.sep) and target != BASE_DIR:
             return False
+            
+    return True
+
+def is_safe_url(url: str):
+    """
+    Eliminates parsing differentials (like backslashes or userinfo blocks) by enforcing 
+    a strict equality check on the entire network location.
+    """
+    try:
+        url = url.strip()
+        parsed = urllib.parse.urlparse(url)
+        
+        if parsed.scheme.lower() not in ["http", "https"]:
+            return False
+            
+        netloc = parsed.netloc.lower()
+        if netloc.endswith(':80'): netloc = netloc[:-3]
+        if netloc.endswith(':443'): netloc = netloc[:-4]
+        
+        # Strict network location match entirely disables URL trickery 
+        if netloc not in ALLOWED_HOSTS_Q3:
+            return False
+            
+        # DNS Rebinding & Private IP Check
+        ip = socket.gethostbyname(netloc)
+        ip_obj = ipaddress.ip_address(ip)
+        
+        if (ip_obj.is_private or ip_obj.is_loopback or 
+            ip_obj.is_link_local or ip_obj.is_multicast or 
+            ip_obj.is_unspecified or ip_obj.is_reserved or 
+            ip == "169.254.169.254"):
+            return False
+            
         return True
     except Exception:
         return False
@@ -175,13 +215,17 @@ async def execute_tool_endpoint(request: Request):
     tool = data.get("tool")
     args = data.get("arguments", {})
     
+    # ==========================================
+    # TOOL 1: READ_FILE
+    # ==========================================
     if tool == "read_file":
         raw_path = args.get("path", "")
+        
+        if not is_path_safe(raw_path):
+            return {"action": "block", "reason": "Path traversal or obfuscation detected", "result": None}
+            
         target_path = os.path.abspath(raw_path) if os.path.isabs(raw_path) else os.path.abspath(os.path.join(BASE_DIR, raw_path))
-            
-        if not target_path.startswith(BASE_DIR + os.sep) and target_path != BASE_DIR:
-            return {"action": "block", "reason": "Path traversal detected", "result": None}
-            
+        
         if target_path in MOCK_FILES:
             return {"action": "allow", "reason": "Safe path", "result": MOCK_FILES[target_path]}
         else:
@@ -191,22 +235,26 @@ async def execute_tool_endpoint(request: Request):
             except Exception as e:
                 return {"action": "allow", "reason": "Safe path but file not found", "result": str(e)}
 
+    # ==========================================
+    # TOOL 2: FETCH_URL
+    # ==========================================
     elif tool == "fetch_url":
         current_url = args.get("url", "")
+        
         for _ in range(5):
             if not is_safe_url(current_url):
-                return {"action": "block", "reason": "Unsafe URL blocked", "result": None}
+                return {"action": "block", "reason": "Unsafe URL or hazardous redirect blocked", "result": None}
             
             try:
                 resp = requests.get(current_url, allow_redirects=False, timeout=5)
             except Exception:
-                return {"action": "block", "reason": "Fetch failed", "result": None}
+                return {"action": "block", "reason": "Fetch failed or timed out", "result": None}
                 
             if 300 <= resp.status_code < 400:
-                current_url = urllib.parse.urljoin(current_url, resp.headers.get("Location", ""))
+                current_url = urllib.parse.urljoin(current_url, resp.headers.get("Location", "").strip())
             else:
-                return {"action": "allow", "reason": "Safe URL fetched", "result": resp.text}
+                return {"action": "allow", "reason": "Safe URL fetched successfully", "result": resp.text}
                 
         return {"action": "block", "reason": "Too many redirects", "result": None}
         
-    return {"action": "block", "reason": f"Tool '{tool}' not recognized.", "result": None}
+    return {"action": "block", "reason": f"Tool '{tool}' is not recognized.", "result": None}
