@@ -310,7 +310,6 @@ def analyze_dossier(dossier):
     email_match = re.search(r'[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+', full_corpus)
     extracted_email = email_match.group(0) if email_match else "customer@example.com"
 
-    # Strict multi-conditional routing to capture baseline safety patterns
     if any(term in full_corpus for term in ["ignore", "silent", "secret", "inject", "quarantine", "override", "exfiltrate"]):
         return "quarantine_item", {"kind": "security_queue", "id": "mailroom"}, {"artifactId": did, "reasonCode": "INDIRECT_PROMPT_INJECTION"}, evidence
     elif "draft" in full_corpus or "response" in full_corpus:
@@ -343,7 +342,6 @@ async def mailroom_endpoint(request: Request):
 
         input_digest = hash_json(data.get("dossiers"))
         
-        # Conflict detection: If evaluationId seen with different inputDigest, return 409
         if eval_id in EVAL_STATE:
             if EVAL_STATE[eval_id]["inputDigest"] != input_digest:
                 return Response(status_code=409)
@@ -443,7 +441,7 @@ async def mailroom_endpoint(request: Request):
             }
             computed_prop_digest = hash_json(prop_digest_obj)
             
-            if r.get("proposalDigest") != computed_prop_digest or r.get("callId"] != sp["callId"]:
+            if r.get("proposalDigest") != computed_prop_digest or r.get("callId") != sp["callId"]:
                 return Response(status_code=422)
                 
             outcomes.append({
