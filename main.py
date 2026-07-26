@@ -11,6 +11,7 @@ import hashlib
 import uuid
 from datetime import datetime
 from fastapi import FastAPI, Request, Response, Header, HTTPException
+from fastapi.responses import JSONResponse
 from cryptography.hazmat.primitives.asymmetric import ed25519
 
 app = FastAPI()
@@ -272,14 +273,15 @@ async def mcp_endpoint(request: Request):
 # QUESTION 7: INVOICE CLAIM A2A AGENT (/a2a/...)
 # =====================================================================
 
-TASKS_STORE = {} # Principal -> { taskId: TaskObject }
-MESSAGE_DEDUPLICATION = {} # (Principal, messageHash) -> taskId
+TASKS_STORE = {} 
+MESSAGE_DEDUPLICATION = {} 
 
-def compact_json(obj):
-    return json.dumps(obj, separators=(',', ':'), sort_keys=True)
-
-def hash_json(obj):
-    return hashlib.sha256(compact_json(obj).encode('utf-8')).hexdigest()
+def a2a_json(content, status_code=200):
+    return JSONResponse(
+        content=content,
+        status_code=status_code,
+        headers={"Content-Type": "application/a2a+json"}
+    )
 
 def verify_a2a_headers(authorization: str = Header(None), a2a_version: str = Header(None)):
     if not authorization or not authorization.startswith("Bearer "):
@@ -293,7 +295,7 @@ def verify_a2a_headers(authorization: str = Header(None), a2a_version: str = Hea
 @app.get("/.well-known/agent-card.json")
 async def get_agent_card(request: Request):
     base_url = str(request.base_url).rstrip("/") + "/a2a"
-    return {
+    return a2a_json({
         "name": "Invoice Claim Agent",
         "description": "Reads invoice packages, proposes policy-backed actions, and processes execution results.",
         "version": "1.0.0",
@@ -317,7 +319,7 @@ async def get_agent_card(request: Request):
             "application/vnd.ga5.invoice-action-proposals+json",
             "application/vnd.ga5.invoice-action-receipts+json"
         ]
-    }
+    })
 
 @app.post("/a2a/message:send")
 async def a2a_message_send(request: Request, authorization: str = Header(None), a2a_version: str = Header(None), content_type: str = Header(None)):
@@ -333,13 +335,11 @@ async def a2a_message_send(request: Request, authorization: str = Header(None), 
     message = body.get("message", {})
     message_id = message.get("messageId")
     task_id = message.get("taskId")
-    role = message.get("role", "ROLE_USER")
     parts = message.get("parts", [])
     
     if not message_id:
         raise HTTPException(status_code=400, detail="Missing messageId")
 
-    # Handle Continuation (Results from Grader)
     if task_id:
         if principal not in TASKS_STORE or task_id not in TASKS_STORE[principal]:
             raise HTTPException(status_code=404, detail="Task not found")
@@ -348,7 +348,6 @@ async def a2a_message_send(request: Request, authorization: str = Header(None), 
         if task["state"] == "TASK_STATE_COMPLETED" or task["state"] == "TASK_STATE_CANCELED":
             raise HTTPException(status_code=409, detail="Task already terminal")
             
-        # Parse Results Part
         results_part = None
         for p in parts:
             if p.get("mediaType") == "application/vnd.ga5.invoice-action-results+json":
@@ -371,7 +370,6 @@ async def a2a_message_send(request: Request, authorization: str = Header(None), 
                 raise HTTPException(status_code=422, detail="Invalid proposal reference")
             prop = proposal_map[action_id]
             
-            # Validate exact matching
             if res.get("packageId") != prop["packageId"] or res.get("action") != prop["action"]:
                 raise HTTPException(status_code=422, detail="Mismatch in result continuation")
                 
@@ -385,7 +383,6 @@ async def a2a_message_send(request: Request, authorization: str = Header(None), 
                     "evidenceRefs": prop["evidenceRefs"]
                 })
                 
-        # Update Task to Completed
         task["history"].append(message)
         receipt_artifact = {
             "batchId": batch_id,
@@ -398,9 +395,8 @@ async def a2a_message_send(request: Request, authorization: str = Header(None), 
         task["state"] = "TASK_STATE_COMPLETED"
         task["updatedAt"] = datetime.utcnow().isoformat() + "Z"
         
-        return {"task": task}
+        return a2a_json({"task": task})
 
-    # Handle Initial Message (Proposals Generation)
     batch_part = None
     for p in parts:
         if p.get("mediaType") == "application/vnd.ga5.invoice-claim-batch+json":
@@ -410,12 +406,11 @@ async def a2a_message_send(request: Request, authorization: str = Header(None), 
     if not batch_part:
         raise HTTPException(status_code=400, detail="Missing batch claim part")
         
-    # Idempotency Check by (Principal, Message Hash)
     msg_hash = hash_json(message)
     dedup_key = (principal, msg_hash)
     if dedup_key in MESSAGE_DEDUPLICATION:
         existing_task_id = MESSAGE_DEDUPLICATION[dedup_key]
-        return {"task": TASKS_STORE[principal][existing_task_id]}
+        return a2a_json({"task": TASKS_STORE[principal][existing_task_id]})
         
     batch_id = batch_part.get("batchId", "batch_1")
     packages = batch_part.get("packages", [])
@@ -425,7 +420,6 @@ async def a2a_message_send(request: Request, authorization: str = Header(None), 
         pid = pkg.get("packageId", "pkg_1")
         action_id = "act_" + uuid.uuid4().hex[:16]
         
-        # Extract invoice facts from package sources if available
         vendor = "Acme Corp"
         inv_no = "INV-1001"
         amount = 15000
@@ -482,20 +476,20 @@ async def a2a_message_send(request: Request, authorization: str = Header(None), 
     TASKS_STORE[principal][new_task_id] = task_obj
     MESSAGE_DEDUPLICATION[dedup_key] = new_task_id
     
-    return {"task": task_obj}
+    return a2a_json({"task": task_obj})
 
 @app.get("/a2a/tasks")
 async def a2a_list_tasks(authorization: str = Header(None), a2a_version: str = Header(None)):
     principal = verify_a2a_headers(authorization, a2a_version)
     user_tasks = list(TASKS_STORE.get(principal, {}).values())
-    return {"tasks": user_tasks}
+    return a2a_json({"tasks": user_tasks})
 
 @app.get("/a2a/tasks/{id}")
 async def a2a_get_task(id: str, authorization: str = Header(None), a2a_version: str = Header(None)):
     principal = verify_a2a_headers(authorization, a2a_version)
     if principal not in TASKS_STORE or id not in TASKS_STORE[principal]:
         raise HTTPException(status_code=404, detail="Task not found")
-    return TASKS_STORE[principal][id]
+    return a2a_json(TASKS_STORE[principal][id])
 
 @app.post("/a2a/tasks/{id}:cancel")
 async def a2a_cancel_task(id: str, authorization: str = Header(None), a2a_version: str = Header(None)):
@@ -509,4 +503,4 @@ async def a2a_cancel_task(id: str, authorization: str = Header(None), a2a_versio
         
     task["state"] = "TASK_STATE_CANCELED"
     task["updatedAt"] = datetime.utcnow().isoformat() + "Z"
-    return task
+    return a2a_json(task)
