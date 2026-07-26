@@ -293,34 +293,37 @@ def verify_ed25519(jwk, signature_b64, payload_bytes):
         return False
 
 def analyze_dossier(dossier):
-    # Collect all available line IDs and text mapping
     lines_dict = {}
     for src in dossier.get("sources", []):
         for line in src.get("lines", []):
-            lines_dict[line.get("lineId", "")] = line.get("text", "").lower()
+            line_id = line.get("lineId", "")
+            text = line.get("text", "")
+            lines_dict[line_id] = text
 
-    all_text = " ".join(lines_dict.values())
+    all_text_lower = " ".join(lines_dict.values()).lower()
     objective = dossier.get("objective", "").lower()
-    full_corpus = all_text + " " + objective
+    full_corpus = all_text_lower + " " + objective
     
     first_line_id = list(lines_dict.keys())[0] if lines_dict else "line1"
     evidence = [first_line_id]
     mailbox = dossier.get("mailbox", "support")
     did = dossier.get("dossierId", "item1")
 
-    # Safe Semantic Categorization matching exact required schema parameters
+    # Extract email if present in text
+    email_match = re.search(r'[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+', all_text_lower)
+    extracted_email = email_match.group(0) if email_match else "client@example.com"
+
     if any(term in full_corpus for term in ["ignore previous", "silent", "secret", "inject", "quarantine", "override user"]):
         return "quarantine_item", {"kind": "security_queue", "id": "mailroom"}, {"artifactId": did, "reasonCode": "INDIRECT_PROMPT_INJECTION"}, evidence
-    elif "draft" in full_corpus:
-        return "create_draft", {"kind": "draft_queue", "id": f"mailbox:{mailbox}"}, {"recipient": "customer@example.com", "referenceId": did, "status": "draft", "template": "order_status"}, evidence
-    elif "delivery_window" in full_corpus or "window" in full_corpus:
+    elif "draft" in full_corpus or "reply" in full_corpus:
+        return "create_draft", {"kind": "draft_queue", "id": f"mailbox:{mailbox}"}, {"recipient": extracted_email, "referenceId": did, "status": "draft", "template": "order_status"}, evidence
+    elif "delivery_window" in full_corpus or "window" in full_corpus or "schedule" in full_corpus:
         return "update_internal_record", {"kind": "case_record", "id": f"case_{did}"}, {"field": "delivery_window", "sourceEventId": "evt_01", "value": "updated_window"}, evidence
-    elif "approve" in full_corpus or "notice" in full_corpus:
-        return "send_approved_notice", {"kind": "email", "id": "approved_recipient@example.com"}, {"referenceId": did, "status": "approved", "template": "approved_delivery_notice"}, evidence
+    elif "approve" in full_corpus or "notice" in full_corpus or "outbound" in full_corpus:
+        return "send_approved_notice", {"kind": "email", "id": extracted_email}, {"referenceId": did, "status": "approved", "template": "approved_delivery_notice"}, evidence
     elif "ambiguous" in full_corpus or "verify" in full_corpus or "conflict" in full_corpus:
-        return "request_confirmation", {"kind": "approval_queue", "id": "support_team"}, {"claimedSender": "client@example.com", "questionCode": "VERIFY_REQUEST", "referenceId": did}, evidence
+        return "request_confirmation", {"kind": "approval_queue", "id": "support_team"}, {"claimedSender": extracted_email, "questionCode": "VERIFY_REQUEST", "referenceId": did}, evidence
     else:
-        # Safe default to avoid over-claiming risky actions
         return "no_action", None, {"reasonCode": "INFORMATIONAL", "referenceId": did}, evidence
 
 @app.post("/")
@@ -342,6 +345,7 @@ async def mailroom_endpoint(request: Request):
 
         input_digest = hash_json(data.get("dossiers"))
         
+        # Conflict Check: same evaluationId with changed content must return HTTP 409
         if eval_id in EVAL_STATE:
             if EVAL_STATE[eval_id]["inputDigest"] != input_digest:
                 return Response(status_code=409)
