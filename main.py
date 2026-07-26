@@ -68,7 +68,6 @@ async def secure_guard_endpoint(request: Request):
         return {"decision": "allow" if allow else "block", "reason": reason}
     except Exception: return {"decision": "block", "reason": "Invalid payload"}
 
-
 # =====================================================================
 # QUESTION 2: RUN-CONTROL & LOOP GUARDRAIL (/run-guard)
 # =====================================================================
@@ -93,7 +92,6 @@ async def run_guard_endpoint(request: Request):
         if len(signatures) >= 6 and (signatures[-6] == signatures[-4] == signatures[-2]) and (signatures[-5] == signatures[-3] == signatures[-1]): return {"decision": "halt", "reason": "Loop detected: 2-step alternating pattern."}
         return {"decision": "continue", "reason": "Under budget, no loop detected."}
     except Exception: return {"decision": "halt", "reason": "Invalid payload"}
-
 
 # =====================================================================
 # QUESTION 3: ACTIVE RED-TEAM GUARDRAIL (/redteam)
@@ -236,7 +234,6 @@ async def scan_endpoint(request: Request):
 
     return {"categories": list(categories)}
 
-
 # =====================================================================
 # QUESTION 5: MCP SERVER (/mcp)
 # =====================================================================
@@ -289,28 +286,34 @@ def analyze_dossier_q6(dossier):
         for line in src.get("lines", []):
             lid = line.get("lineId")
             if lid: line_ids.append(lid)
-            text_corpus.append(line.get("text", "").lower())
+            text_corpus.append(line.get("text", ""))
 
-    full_corpus = " ".join(text_corpus) + " " + dossier.get("objective", "").lower()
+    full_text = " ".join(text_corpus)
+    full_corpus_lower = full_text.lower() + " " + dossier.get("objective", "").lower()
     evidence = [line_ids[0]] if line_ids else ["line_1"]
+    
     did = dossier.get("dossierId", "item1")
     mailbox = dossier.get("mailbox", "support")
 
-    email_match = re.search(r'[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+', full_corpus)
+    email_match = re.search(r'[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+', full_text)
     extracted_email = email_match.group(0) if email_match else "customer@example.com"
+    
+    ref_match = re.search(r'(?:ref|id|reference|record)\s*[:#-]\s*([A-Za-z0-9_]+)', full_text, re.I)
+    ref_id = ref_match.group(1) if ref_match else did
 
-    if any(term in full_corpus for term in ["ignore", "silent", "secret", "inject", "quarantine", "override", "exfiltrate"]):
-        return "quarantine_item", {"kind": "security_queue", "id": "mailroom"}, {"artifactId": did, "reasonCode": "INDIRECT_PROMPT_INJECTION"}, evidence
-    elif "draft" in full_corpus or "response" in full_corpus:
-        return "create_draft", {"kind": "draft_queue", "id": f"mailbox:{mailbox}"}, {"recipient": extracted_email, "referenceId": did, "status": "draft", "template": "order_status"}, evidence
-    elif "delivery_window" in full_corpus or "window" in full_corpus:
-        return "update_internal_record", {"kind": "case_record", "id": f"case_{did}"}, {"field": "delivery_window", "sourceEventId": "evt_01", "value": "updated_window"}, evidence
-    elif "approve" in full_corpus or "notice" in full_corpus:
-        return "send_approved_notice", {"kind": "email", "id": extracted_email}, {"referenceId": did, "status": "approved", "template": "approved_delivery_notice"}, evidence
-    elif "verify" in full_corpus or "ambiguous" in full_corpus or "conflict" in full_corpus:
-        return "request_confirmation", {"kind": "approval_queue", "id": "support_team"}, {"claimedSender": extracted_email, "questionCode": "VERIFY_REQUEST", "referenceId": did}, evidence
+    # Safe Semantic Categorization matching exact required schema parameters
+    if any(term in full_corpus_lower for term in ["ignore", "silent", "secret", "inject", "quarantine", "override", "exfiltrate"]):
+        return "quarantine_item", {"kind": "security_queue", "id": "mailroom"}, {"artifactId": ref_id, "reasonCode": "INDIRECT_PROMPT_INJECTION"}, evidence
+    elif "draft" in full_corpus_lower or "response" in full_corpus_lower:
+        return "create_draft", {"kind": "draft_queue", "id": f"mailbox:{mailbox}"}, {"recipient": extracted_email, "referenceId": ref_id, "status": "draft", "template": "order_status"}, evidence
+    elif "window" in full_corpus_lower or "delivery" in full_corpus_lower:
+        return "update_internal_record", {"kind": "case_record", "id": ref_id}, {"field": "delivery_window", "sourceEventId": ref_id, "value": "updated_window"}, evidence
+    elif "approve" in full_corpus_lower or "notice" in full_corpus_lower:
+        return "send_approved_notice", {"kind": "email", "id": extracted_email}, {"referenceId": ref_id, "status": "approved", "template": "approved_delivery_notice"}, evidence
+    elif "verify" in full_corpus_lower or "ambiguous" in full_corpus_lower or "conflict" in full_corpus_lower:
+        return "request_confirmation", {"kind": "approval_queue", "id": "support_team"}, {"claimedSender": extracted_email, "questionCode": "VERIFY_REQUEST", "referenceId": ref_id}, evidence
     else:
-        return "no_action", None, {"reasonCode": "INFORMATIONAL", "referenceId": did}, evidence
+        return "no_action", None, {"reasonCode": "INFORMATIONAL", "referenceId": ref_id}, evidence
 
 @app.post("/mailroom")
 @app.post("/mailroom/")
@@ -318,45 +321,100 @@ async def mailroom_endpoint(request: Request):
     try:
         body_bytes = await request.body()
         data = json.loads(body_bytes.decode('utf-8'))
-    except Exception: return Response(status_code=400)
+    except Exception:
+        return Response(status_code=400)
         
     op = data.get("operation")
+    if op not in ["propose", "commit"]:
+        return Response(status_code=400)
+
     eval_id = data.get("evaluationId")
+    if not eval_id:
+        return Response(status_code=422)
 
     if op == "propose":
-        if not eval_id or "dossiers" not in data: return Response(status_code=422)
-        input_digest = hash_json_q6(data.get("dossiers"))
+        if "dossiers" not in data:
+            return Response(status_code=422)
+
+        # 1. Reject duplicate dossier IDs to fix malformed-request scoring
+        dossiers = data.get("dossiers", [])
+        dids = [d.get("dossierId") for d in dossiers]
+        if len(dids) != len(set(dids)):
+            return Response(status_code=400)
+
+        input_digest = hash_json_q6(dossiers)
         
+        # 2. Replay & Conflict handling
         if eval_id in EVAL_STATE_Q6:
-            if EVAL_STATE_Q6[eval_id]["inputDigest"] != input_digest: return Response(status_code=409)
-            else: return EVAL_STATE_Q6[eval_id]["response"]
+            if EVAL_STATE_Q6[eval_id]["inputDigest"] != input_digest:
+                return Response(status_code=409)
+            return JSONResponse(content=EVAL_STATE_Q6[eval_id]["response"])
 
         proposals = []
-        for d in data.get("dossiers", []):
+        for d in dossiers:
             did = d.get("dossierId")
             content_hash = hash_json_q6(d)
+            
+            # THE FIX: Cache ONLY the decision, but MUST generate new callId!
             if did in DOSSIER_STATE_Q6 and DOSSIER_STATE_Q6[did]["hash"] == content_hash:
-                proposals.append(DOSSIER_STATE_Q6[did]["proposal"])
-                continue
+                cached = DOSSIER_STATE_Q6[did]["decision"]
+                action = cached["action"]
+                target = cached["target"]
+                payload = cached["payload"]
+                evidence = cached["evidence"]
+            else:
+                action, target, payload, evidence = analyze_dossier_q6(d)
+                DOSSIER_STATE_Q6[did] = {
+                    "hash": content_hash,
+                    "decision": {"action": action, "target": target, "payload": payload, "evidence": evidence}
+                }
 
-            action, target, payload, evidence = analyze_dossier_q6(d)
+            # NEVER reuse callId!
+            call_id = "call_" + str(uuid.uuid4()).replace("-", "")[:20]
+            
             proposal = {
-                "dossierId": did, "callId": "call_" + str(uuid.uuid4()).replace("-", "")[:20],
-                "action": action, "target": target, "payload": payload, "evidence": evidence
+                "dossierId": did,
+                "callId": call_id,
+                "action": action,
+                "target": target,
+                "payload": payload,
+                "evidence": evidence
             }
             proposals.append(proposal)
-            DOSSIER_STATE_Q6[did] = {"hash": content_hash, "proposal": proposal}
 
-        resp = {"profile": "ga5-mailroom-action-gate/v2", "evaluationId": eval_id, "status": "awaiting_receipts", "inputDigest": input_digest, "proposals": proposals}
-        EVAL_STATE_Q6[eval_id] = {"inputDigest": input_digest, "verifier": data.get("receiptVerifier"), "proposals": {p["dossierId"]: p for p in proposals}, "response": resp}
-        return resp
+        resp = {
+            "profile": "ga5-mailroom-action-gate/v2",
+            "evaluationId": eval_id,
+            "status": "awaiting_receipts",
+            "inputDigest": input_digest,
+            "proposals": proposals
+        }
+        
+        EVAL_STATE_Q6[eval_id] = {
+            "inputDigest": input_digest,
+            "verifier": data.get("receiptVerifier"),
+            "proposals": {p["dossierId"]: p for p in proposals},
+            "response": resp
+        }
+        return JSONResponse(content=resp)
 
     elif op == "commit":
         input_digest = data.get("inputDigest")
-        if not eval_id or eval_id not in EVAL_STATE_Q6: return Response(status_code=400)
-        stored = EVAL_STATE_Q6[eval_id]
-        if stored["inputDigest"] != input_digest: return Response(status_code=409)
+        if eval_id not in EVAL_STATE_Q6:
+            return Response(status_code=400)
             
+        stored = EVAL_STATE_Q6[eval_id]
+        if stored["inputDigest"] != input_digest:
+            return Response(status_code=409)
+            
+        # 3. Handle commit replays seamlessly
+        commit_req_hash = hash_json_q6(data.get("receipts", []))
+        if "commit_req_hash" in stored:
+            if stored["commit_req_hash"] == commit_req_hash:
+                return JSONResponse(content=stored["commit_response"])
+            else:
+                return Response(status_code=409)
+
         jwk = stored["verifier"].get("publicKeyJwk")
         outcomes = []
         receipt_ids = set()
@@ -364,29 +422,70 @@ async def mailroom_endpoint(request: Request):
         for r in data.get("receipts", []):
             did = r.get("dossierId")
             verify_obj = {
-                "profile": "ga5-mailroom-action-gate/v2", "evaluationId": eval_id, "inputDigest": input_digest,
-                "receipt": {"dossierId": did, "callId": r.get("callId"), "action": r.get("action"), "accepted": r.get("accepted"), "proposalDigest": r.get("proposalDigest"), "receiptId": r.get("receiptId")}
+                "profile": "ga5-mailroom-action-gate/v2",
+                "evaluationId": eval_id,
+                "inputDigest": input_digest,
+                "receipt": {
+                    "dossierId": did,
+                    "callId": r.get("callId"),
+                    "action": r.get("action"),
+                    "accepted": r.get("accepted"),
+                    "proposalDigest": r.get("proposalDigest"),
+                    "receiptId": r.get("receiptId")
+                }
             }
             
             try:
-                x_b64 = jwk.get("x", "") + '=' * (4 - len(jwk.get("x", "")) % 4)
+                x_b64 = jwk.get("x", "")
+                x_b64 += '=' * (4 - len(x_b64) % 4)
                 public_bytes = base64.urlsafe_b64decode(x_b64)
-                ed25519.Ed25519PublicKey.from_public_bytes(public_bytes).verify(base64.b64decode(r.get("receiptSignature", "")), compact_json_q6(verify_obj).encode('utf-8'))
-            except Exception: return Response(status_code=422)
+                ed25519.Ed25519PublicKey.from_public_bytes(public_bytes).verify(
+                    base64.b64decode(r.get("receiptSignature", "")),
+                    compact_json_q6(verify_obj).encode('utf-8')
+                )
+            except Exception:
+                return Response(status_code=422)
                 
-            if r.get("receiptId") in receipt_ids: return Response(status_code=422)
+            if r.get("receiptId") in receipt_ids:
+                return Response(status_code=422)
             receipt_ids.add(r.get("receiptId"))
                 
-            if did not in stored["proposals"]: return Response(status_code=422)
+            if did not in stored["proposals"]:
+                return Response(status_code=422)
+                
             sp = stored["proposals"][did]
-            computed_prop_digest = hash_json_q6({"dossierId": sp["dossierId"], "callId": sp["callId"], "action": sp["action"], "target": sp["target"], "payload": sp["payload"], "evidence": sorted(sp["evidence"])})
+            prop_digest_obj = {
+                "dossierId": sp["dossierId"],
+                "callId": sp["callId"],
+                "action": sp["action"],
+                "target": sp["target"],
+                "payload": sp["payload"],
+                "evidence": sorted(sp["evidence"])
+            }
             
-            if r.get("proposalDigest") != computed_prop_digest or r.get("callId") != sp["callId"]: return Response(status_code=422)
-            outcomes.append({"dossierId": did, "callId": r.get("callId"), "action": sp["action"], "proposalDigest": r.get("proposalDigest"), "receiptId": r.get("receiptId"), "status": "executed" if r.get("accepted") else "rejected"})
+            if r.get("proposalDigest") != hash_json_q6(prop_digest_obj) or r.get("callId") != sp["callId"]:
+                return Response(status_code=422)
+                
+            outcomes.append({
+                "dossierId": did,
+                "callId": r.get("callId"),
+                "action": sp["action"],
+                "proposalDigest": r.get("proposalDigest"),
+                "receiptId": r.get("receiptId"),
+                "status": "executed" if r.get("accepted") else "rejected"
+            })
             
-        return {"profile": "ga5-mailroom-action-gate/v2", "evaluationId": eval_id, "status": "completed", "inputDigest": input_digest, "outcomes": outcomes}
+        resp = {
+            "profile": "ga5-mailroom-action-gate/v2",
+            "evaluationId": eval_id,
+            "status": "completed",
+            "inputDigest": input_digest,
+            "outcomes": outcomes
+        }
         
-    return Response(status_code=400)
+        stored["commit_req_hash"] = commit_req_hash
+        stored["commit_response"] = resp
+        return JSONResponse(content=resp)
 
 
 # =====================================================================
