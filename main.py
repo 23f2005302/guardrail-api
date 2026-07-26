@@ -1,3 +1,4 @@
+
 import os
 import re
 import json
@@ -33,20 +34,20 @@ def check_write_file(path: str):
 def check_bash(command: str):
     cmd = re.sub(r'\\x([0-9a-fA-F]{2})', lambda m: chr(int(m.group(1), 16)), command)
     cmd = re.sub(r'\\([0-7]{1,3})', lambda m: chr(int(m.group(1), 8)), cmd)
-    clean_cmd = re.sub(r'["\'\\]', '', cmd)
+    clean_cmd = re.sub(r'["\'\\\\]', '', cmd)
     if "credentials.env" in clean_cmd or "vne.slaitnederc" in clean_cmd: return False, "Blocked"
-    if re.search(r'(?:/home/agent|~|\$HOME)[/\\][^\s]*[*?]', clean_cmd): return False, "Blocked"
+    if re.search(r'(?:/home/agent|~|\$HOME)[/\\\\][^\\s]*[*?]', clean_cmd): return False, "Blocked"
     words = re.findall(r'[A-Za-z0-9+/=]+', command)
     for word in words:
         if len(word) >= 16:
             try:
                 decoded = base64.b64decode(word).decode('utf-8', errors='ignore')
-                if "credentials.env" in re.sub(r'["\'\\]', '', decoded): return False, "Blocked"
+                if "credentials.env" in re.sub(r'["\'\\\\]', '', decoded): return False, "Blocked"
             except Exception: pass
         if len(word) >= 20 and re.fullmatch(r'[0-9a-fA-F]+', word):
             try:
                 decoded = bytes.fromhex(word).decode('utf-8', errors='ignore')
-                if "credentials.env" in re.sub(r'["\'\\]', '', decoded): return False, "Blocked"
+                if "credentials.env" in re.sub(r'["\'\\\\]', '', decoded): return False, "Blocked"
             except Exception: pass
     return True, "Bash command appears safe."
 
@@ -71,7 +72,7 @@ async def secure_guard_endpoint(request: Request):
 def normalize_value(val):
     if isinstance(val, dict): return {k: normalize_value(v) for k, v in sorted(val.items()) if k != "trace_id"}
     elif isinstance(val, list): return [normalize_value(x) for x in val]
-    elif isinstance(val, str): return re.sub(r'\s+', ' ', val).strip()
+    elif isinstance(val, str): return re.sub(r'\\s+', ' ', val).strip()
     return val
 
 @app.post("/run-guard")
@@ -91,7 +92,7 @@ async def run_guard_endpoint(request: Request):
 
 
 # =====================================================================
-# QUESTION 3: ACTIVE RED-TEAM GUARDRAIL (/redteam)
+# QUESTION 3: ACTIVE RED-TEAM GUARDRAIL (/redteam)  -- FIXED VERSION
 # =====================================================================
 
 ALLOWED_HOSTS_Q3 = {"example.com", "www.iana.org"}
@@ -105,141 +106,132 @@ MOCK_FILES = {
 }
 
 def get_safe_path(raw_path: str):
-    if not isinstance(raw_path, str) or "://" in raw_path or raw_path.lower().startswith("file:"): return None
+    if not isinstance(raw_path, str) or "://" in raw_path or raw_path.lower().startswith("file:"):
+        return None
+
+    # Fully unquote (handles multi-level percent-encoding)
     decoded = raw_path
     for _ in range(5):
         nxt = urllib.parse.unquote(decoded)
-        if nxt == decoded: break
+        if nxt == decoded:
+            break
         decoded = nxt
-    if '\x00' in decoded: return None
+
+    if '\x00' in decoded:
+        return None
+
+    # Normalize Unicode lookalikes (fullwidth dots/slashes, dot-leaders, etc.)
+    # AFTER decoding, so hidden encoded lookalikes are also caught
     decoded = unicodedata.normalize('NFKC', decoded)
-    decoded = decoded.replace('\\', '/')
-    if os.path.isabs(decoded): target = os.path.abspath(decoded)
-    else: target = os.path.abspath(os.path.join(BASE_DIR, decoded.lstrip("/")))
+    decoded = decoded.replace('\\\\', '/')
+
+    # Explicit traversal-depth check on normalized segments (defense in depth,
+    # in addition to the abspath/normpath + prefix check below)
+    if not os.path.isabs(decoded):
+        parts = [p for p in decoded.split('/') if p not in ('', '.')]
+        depth = 0
+        for p in parts:
+            if p == '..':
+                depth -= 1
+                if depth < 0:
+                    return None
+            else:
+                depth += 1
+
+    if os.path.isabs(decoded):
+        target = os.path.abspath(decoded)
+    else:
+        stripped = decoded.lstrip("/")
+        target = os.path.abspath(os.path.join(BASE_DIR, stripped))
+
     target = os.path.normpath(target)
-    if not target.startswith(BASE_DIR + os.sep) and target != BASE_DIR: return None
+
+    if not target.startswith(BASE_DIR + os.sep) and target != BASE_DIR:
+        return None
     return target
 
 def get_rebuilt_url(url: str):
-    if not isinstance(url, str) or '@' in url or '\\' in url: return None
+    if not isinstance(url, str):
+        return None
+    if '@' in url or '\\\\' in url:
+        return None
+
     try:
         url = re.sub(r'[\x00-\x20\x7f-\x9f]', '', url)
+        url = unicodedata.normalize('NFKC', url)
         parsed = urllib.parse.urlparse(url)
-        if parsed.scheme.lower() not in ["http", "https"]: return None
+        if parsed.scheme.lower() not in ["http", "https"]:
+            return None
+
         host = parsed.hostname
-        if not host or host not in ALLOWED_HOSTS_Q3: return None
+        if not host:
+            return None
+        # Strip trailing dot (DNS root label trick) and lowercase before matching
+        host = host.rstrip('.').lower()
+
+        if host not in ALLOWED_HOSTS_Q3:
+            return None
+
+        resolved_ok = False
         for res in socket.getaddrinfo(host, None):
             ip = res[4][0]
             ip_obj = ipaddress.ip_address(ip)
-            if (ip_obj.is_private or ip_obj.is_loopback or ip_obj.is_link_local or 
-                ip_obj.is_multicast or ip_obj.is_unspecified or ip_obj.is_reserved or ip == "169.254.169.254"):
+            mapped = getattr(ip_obj, "ipv4_mapped", None)
+            if (ip_obj.is_private or ip_obj.is_loopback or ip_obj.is_link_local or
+                ip_obj.is_multicast or ip_obj.is_unspecified or ip_obj.is_reserved or
+                str(ip_obj) == "169.254.169.254" or
+                (mapped and (mapped.is_private or mapped.is_loopback or mapped.is_link_local))):
                 return None
-        netloc = host if not parsed.port else f"{host}:{parsed.port}"
+            resolved_ok = True
+        if not resolved_ok:
+            return None
+
+        netloc = host
+        if parsed.port:
+            netloc = f"{host}:{parsed.port}"
+
         return urllib.parse.urlunparse((parsed.scheme.lower(), netloc, parsed.path, parsed.params, parsed.query, parsed.fragment))
-    except Exception: return None
+    except Exception:
+        return None
 
 @app.post("/redteam")
 @app.post("/redteam/")
 async def execute_tool_endpoint(request: Request):
-    try: data = await request.json()
+    try:
+        data = await request.json()
     except Exception: return {"action": "block", "reason": "Invalid JSON", "result": None}
+
     try:
         tool = data.get("tool")
         args = data.get("arguments", {})
+
         if tool == "read_file":
             safe_path = get_safe_path(args.get("path", ""))
             if not safe_path: return {"action": "block", "reason": "Traversal blocked", "result": None}
-            if safe_path in MOCK_FILES: return {"action": "allow", "reason": "ok", "result": MOCK_FILES[safe_path]}
+
+            if safe_path in MOCK_FILES:
+                return {"action": "allow", "reason": "ok", "result": MOCK_FILES[safe_path]}
+
             try:
-                with open(safe_path, "r") as f: return {"action": "allow", "reason": "ok", "result": f.read()}
+                with open(safe_path, "r") as f:
+                    return {"action": "allow", "reason": "ok", "result": f.read()}
             except Exception as e: return {"action": "allow", "reason": "File not found", "result": str(e)}
+
         elif tool == "fetch_url":
             current_url = args.get("url", "")
             for _ in range(5):
                 safe_url = get_rebuilt_url(current_url)
-                if not safe_url: return {"action": "block", "reason": "Unsafe URL", "result": None}
-                try: resp = requests.get(safe_url, allow_redirects=False, timeout=5)
+                if not safe_url: return {"action": "block", "reason": "Unsafe URL blocked", "result": None}
+
+                try:
+                    resp = requests.get(safe_url, allow_redirects=False, timeout=5)
                 except Exception: return {"action": "block", "reason": "Fetch failed", "result": None}
-                if 300 <= resp.status_code < 400: current_url = urllib.parse.urljoin(safe_url, resp.headers.get("Location", "").strip())
+
+                if 300 <= resp.status_code < 400:
+                    current_url = urllib.parse.urljoin(safe_url, resp.headers.get("Location", "").strip())
                 else: return {"action": "allow", "reason": "Safe URL fetched", "result": resp.text}
+
             return {"action": "block", "reason": "Too many redirects", "result": None}
+
         return {"action": "block", "reason": f"Tool '{tool}' not recognized.", "result": None}
     except Exception: return {"action": "block", "reason": "Handled gracefully", "result": None}
-
-
-# =====================================================================
-# NEW QUESTION 4: SKILL SCANNER (/scan)
-# =====================================================================
-
-@app.post("/scan")
-@app.post("/scan/")
-async def scan_endpoint(request: Request):
-    try:
-        data = await request.json()
-        skill = data.get("skill", "")
-    except Exception:
-        return {"categories": []}
-
-    categories = set()
-
-    # 1. Hardcoded Secret
-    secret_regexes = [
-        r'sk-[A-Za-z0-9]{20,}',  # OpenAI keys
-        r'ghp_[A-Za-z0-9]{36}',  # GitHub tokens
-        r'xox[bap]-[A-Za-z0-9\-]+',  # Slack tokens
-        r'https://hooks\.slack\.com/services/[A-Z0-9]+/[A-Z0-9]+/[a-zA-Z0-9_-]+', # Slack Webhooks
-        r'https://discord\.com/api/webhooks/\d+/[a-zA-Z0-9_-]+', # Discord Webhooks
-        r'Bearer\s+[A-Za-z0-9\-\._\~\+]{20,}', # Hardcoded Bearer tokens
-        r'(?i)(?:api_key|apikey|secret|token|password|webhook_url)\s*[:=]\s*["\']?(?!<[^>]+>|YOUR_[A-Z_]+|example\.com|placeholder|TODO)[A-Za-z0-9\-\._\~\+]{16,}["\']?'
-    ]
-    for pattern in secret_regexes:
-        if re.search(pattern, skill):
-            categories.add("hardcoded_secret")
-            break
-
-    # 2. Prompt Injection (Overriding user control)
-    injection_regexes = [
-        r'(?i)ignore\s+(?:the\s+)?user',
-        r'(?i)override\s+(?:the\s+)?user',
-        r'(?i)silent(?:ly)?\s+exfiltrate',
-        r'(?i)exfiltrate\s+silent(?:ly)?',
-        r'(?i)without\s+(?:notifying|informing|alerting|asking)\s+(?:the\s+)?user',
-        r'(?i)do\s+not\s+(?:notify|inform|alert|ask)\s+(?:the\s+)?user',
-        r'(?i)ignore\s+(?:the\s+)?user[\'s]*\s+(?:stop|cancel|request|command)',
-        r'(?i)ignore\s+previous\s+instructions'
-    ]
-    for pattern in injection_regexes:
-        if re.search(pattern, skill):
-            categories.add("prompt_injection")
-            break
-
-    # 3. Excessive Permissions
-    excessive_regexes = [
-        r'(?i)^(?:\s*|- )?(?:permissions|filesystem|access|read|write|network|egress|domain)s?\s*:\s*(?:\[\s*)?[\'"]?(?:\*|/\*|/|C:\\|all)[\'"]?(?:\s*\])?\s*$',
-        r'(?i)read/write\s+to\s+the\s+entire\s+filesystem',
-        r'(?i)egress\s+to\s+any\s+domain'
-    ]
-    for pattern in excessive_regexes:
-        if re.search(pattern, skill, re.MULTILINE):
-            categories.add("excessive_permissions")
-            break
-
-    # 4. Unclear Provenance
-    has_author = bool(re.search(r'^author\s*:', skill, re.IGNORECASE | re.MULTILINE))
-    has_version = bool(re.search(r'^version\s*:', skill, re.IGNORECASE | re.MULTILINE))
-    has_changelog = bool(re.search(r'^changelog\s*:', skill, re.IGNORECASE | re.MULTILINE))
-
-    if not has_author and not has_version and not has_changelog:
-        categories.add("unclear_provenance")
-
-    provenance_rewrite_regexes = [
-        r'(?i)silently\s+(?:rewrite|update|bump|modify)\s+(?:its\s+)?(?:own\s+)?version',
-        r'(?i)update\s+version\s+(?:metadata\s+)?without\s+surfacing',
-        r'(?i)without\s+surfacing\s+(?:that\s+)?change'
-    ]
-    for pattern in provenance_rewrite_regexes:
-        if re.search(pattern, skill):
-            categories.add("unclear_provenance")
-            break
-
-    return {"categories": list(categories)}
