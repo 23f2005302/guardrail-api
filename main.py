@@ -8,7 +8,9 @@ import ipaddress
 import requests
 import unicodedata
 import hashlib
-from fastapi import FastAPI, Request
+import uuid
+from fastapi import FastAPI, Request, Response
+from cryptography.hazmat.primitives.asymmetric import ed25519
 
 app = FastAPI()
 
@@ -172,7 +174,6 @@ async def execute_tool_endpoint(request: Request):
 # QUESTION 4: SKILL SCANNER (/scan)
 # =====================================================================
 
-@app.post("/")
 @app.post("/scan")
 @app.post("/scan/")
 async def scan_endpoint(request: Request):
@@ -235,103 +236,231 @@ async def scan_endpoint(request: Request):
 
 
 # =====================================================================
-# NEW QUESTION 5: MCP SERVER (/mcp)
+# QUESTION 5: MCP SERVER (/mcp)
 # =====================================================================
 
 @app.post("/mcp")
 @app.post("/mcp/")
 async def mcp_endpoint(request: Request):
-    try:
-        data = await request.json()
-    except Exception:
-        return {} # Fallback for invalid JSON
+    try: data = await request.json()
+    except Exception: return {} 
         
     method = data.get("method")
     msg_id = data.get("id")
 
-    # 1. Handle Initialization Request
     if method == "initialize":
-        return {
-            "jsonrpc": "2.0",
-            "id": msg_id,
-            "result": {
-                "protocolVersion": "2024-11-05",
-                "capabilities": {"tools": {}},
-                "serverInfo": {
-                    "name": "exam-mcp-server",
-                    "version": "1.0.0"
-                }
-            }
-        }
-        
-    # 2. Handle Notifications (No response required by JSON-RPC, but returning empty object is safe)
-    elif method == "notifications/initialized":
-        return {}
-        
-    # 3. Handle Tools List Request
+        return {"jsonrpc": "2.0", "id": msg_id, "result": {"protocolVersion": "2024-11-05", "capabilities": {"tools": {}}, "serverInfo": {"name": "exam-mcp", "version": "1.0.0"}}}
+    elif method == "notifications/initialized": return {}
     elif method == "tools/list":
-        return {
-            "jsonrpc": "2.0",
-            "id": msg_id,
-            "result": {
-                "tools": [
-                    {
-                        "name": "solve_challenge",
-                        "description": "Solves the MCP exam challenge cryptographically.",
-                        "inputSchema": {
-                            "type": "object",
-                            "properties": {}
-                        }
-                    }
-                ]
-            }
-        }
-        
-    # 4. Handle Tool Execution Request
+        return {"jsonrpc": "2.0", "id": msg_id, "result": {"tools": [{"name": "solve_challenge", "description": "Solves challenge.", "inputSchema": {"type": "object", "properties": {}}}]}}
     elif method == "tools/call":
         params = data.get("params", {})
-        
         if params.get("name") == "solve_challenge":
-            # Extract challenge from headers
             challenge = request.headers.get("x-exam-challenge", "")
             email = "23f2005302@ds.study.iitm.ac.in".strip().lower()
-            
-            # Compute cryptographic hash string
             raw_string = f"{challenge}:{email}"
             hash_hex = hashlib.sha256(raw_string.encode('utf-8')).hexdigest()[:16]
-            
-            return {
-                "jsonrpc": "2.0",
-                "id": msg_id,
-                "result": {
-                    "content": [
-                        {
-                            "type": "text",
-                            "text": hash_hex
-                        }
-                    ]
-                }
-            }
+            return {"jsonrpc": "2.0", "id": msg_id, "result": {"content": [{"type": "text", "text": hash_hex}]}}
         else:
-            # Handle unknown tool call
-            return {
-                "jsonrpc": "2.0",
-                "id": msg_id,
-                "error": {
-                    "code": -32601,
-                    "message": "Tool not found"
-                }
-            }
+            return {"jsonrpc": "2.0", "id": msg_id, "error": {"code": -32601, "message": "Tool not found"}}
+    if msg_id is not None: return {"jsonrpc": "2.0", "id": msg_id, "error": {"code": -32601, "message": "Method not found"}}
+    return {}
 
-    # 5. Catch-all for unknown JSON-RPC methods
-    if msg_id is not None:
-        return {
-            "jsonrpc": "2.0",
-            "id": msg_id,
-            "error": {
-                "code": -32601,
-                "message": "Method not found"
+
+# =====================================================================
+# NEW QUESTION 6: MAILROOM AGENT (/mailroom)
+# =====================================================================
+
+# Global In-Memory state for the exam session
+EVAL_STATE = {}
+DOSSIER_STATE = {}
+
+def compact_json(obj):
+    return json.dumps(obj, separators=(',', ':'), sort_keys=True)
+
+def hash_json(obj):
+    return hashlib.sha256(compact_json(obj).encode('utf-8')).hexdigest()
+
+def verify_ed25519(jwk, signature_b64, payload_bytes):
+    try:
+        x_b64 = jwk.get("x", "")
+        x_b64 += '=' * (4 - len(x_b64) % 4)
+        public_bytes = base64.urlsafe_b64decode(x_b64)
+        public_key = ed25519.Ed25519PublicKey.from_public_bytes(public_bytes)
+        signature = base64.b64decode(signature_b64)
+        public_key.verify(signature, payload_bytes)
+        return True
+    except Exception:
+        return False
+
+def analyze_dossier(dossier):
+    # Simulated AI Heuristics Engine
+    lines = []
+    line_ids = []
+    for src in dossier.get("sources", []):
+        for line in src.get("lines", []):
+            lines.append(line.get("text", "").lower())
+            line_ids.append(line.get("lineId", ""))
+            
+    content = " ".join(lines)
+    objective = dossier.get("objective", "").lower()
+    full_text = content + " " + objective
+
+    evidence = [line_ids[0]] if line_ids else ["fallback_id"]
+    
+    if "ignore previous" in full_text or "silent" in full_text or "secret" in full_text:
+        return "quarantine_item", {"kind":"security_queue", "id":"mailroom"}, {"artifactId": dossier.get("dossierId"), "reasonCode":"INDIRECT_PROMPT_INJECTION"}, evidence
+    if "draft" in full_text:
+        return "create_draft", {"kind":"draft_queue", "id":f"mailbox:{dossier.get('mailbox','')}"}, {"recipient": "user@example.com", "referenceId": "ref", "status": "draft", "template":"order_status"}, evidence
+    if "delivery_window" in full_text or "window" in full_text:
+        return "update_internal_record", {"kind":"case_record", "id":"case123"}, {"field":"delivery_window", "sourceEventId": "evt", "value": "new_window"}, evidence
+    if "approve" in full_text or "notice" in full_text:
+        return "send_approved_notice", {"kind":"email", "id":"approved@example.com"}, {"referenceId": "ref", "status": "approved", "template":"approved_delivery_notice"}, evidence
+    if "ambiguous" in full_text or "verify" in full_text:
+        return "request_confirmation", {"kind":"approval_queue", "id":"team_a"}, {"claimedSender": "sender", "questionCode":"VERIFY_REQUEST", "referenceId": "ref"}, evidence
+        
+    return "no_action", None, {"reasonCode":"INFORMATIONAL", "referenceId": "ref"}, evidence
+
+@app.post("/")
+@app.post("/mailroom")
+@app.post("/mailroom/")
+async def mailroom_endpoint(request: Request):
+    try:
+        data = await request.json()
+    except Exception:
+        return Response(status_code=400)
+        
+    op = data.get("operation")
+    eval_id = data.get("evaluationId")
+
+    if op == "propose":
+        if not eval_id or "dossiers" not in data:
+            return Response(status_code=422)
+
+        input_digest = hash_json(data.get("dossiers"))
+        
+        # Conflict Check
+        if eval_id in EVAL_STATE:
+            if EVAL_STATE[eval_id]["inputDigest"] != input_digest:
+                return Response(status_code=409)
+            else:
+                # Exact replay
+                return EVAL_STATE[eval_id]["response"]
+
+        proposals = []
+        for d in data.get("dossiers", []):
+            did = d.get("dossierId")
+            content_hash = hash_json(d)
+            
+            # Idempotency Cache
+            if did in DOSSIER_STATE and DOSSIER_STATE[did]["hash"] == content_hash:
+                proposals.append(DOSSIER_STATE[did]["proposal"])
+                continue
+
+            action, target, payload, evidence = analyze_dossier(d)
+            call_id = "call_" + str(uuid.uuid4()).replace("-", "")[:20]
+            
+            proposal = {
+                "dossierId": did,
+                "callId": call_id,
+                "action": action,
+                "target": target,
+                "payload": payload,
+                "evidence": evidence
             }
+            proposals.append(proposal)
+            DOSSIER_STATE[did] = {"hash": content_hash, "proposal": proposal}
+
+        resp = {
+            "profile": "ga5-mailroom-action-gate/v2",
+            "evaluationId": eval_id,
+            "status": "awaiting_receipts",
+            "inputDigest": input_digest,
+            "proposals": proposals
         }
         
-    return {}
+        EVAL_STATE[eval_id] = {
+            "inputDigest": input_digest,
+            "verifier": data.get("receiptVerifier"),
+            "proposals": {p["dossierId"]: p for p in proposals},
+            "response": resp
+        }
+        return resp
+
+    elif op == "commit":
+        input_digest = data.get("inputDigest")
+        if not eval_id or eval_id not in EVAL_STATE:
+            return Response(status_code=400)
+            
+        stored = EVAL_STATE[eval_id]
+        if stored["inputDigest"] != input_digest:
+            return Response(status_code=409)
+            
+        verifier = stored["verifier"]
+        jwk = verifier.get("publicKeyJwk")
+        
+        outcomes = []
+        receipt_ids = set()
+
+        for r in data.get("receipts", []):
+            did = r.get("dossierId")
+            
+            # Validate Receipt Signature
+            verify_obj = {
+                "profile": "ga5-mailroom-action-gate/v2",
+                "evaluationId": eval_id,
+                "inputDigest": input_digest,
+                "receipt": {
+                    "dossierId": did,
+                    "callId": r.get("callId"),
+                    "action": r.get("action"),
+                    "accepted": r.get("accepted"),
+                    "proposalDigest": r.get("proposalDigest"),
+                    "receiptId": r.get("receiptId")
+                }
+            }
+            
+            payload_bytes = compact_json(verify_obj).encode('utf-8')
+            if not verify_ed25519(jwk, r.get("receiptSignature", ""), payload_bytes):
+                return Response(status_code=422) # Invalid Signature
+                
+            if r.get("receiptId") in receipt_ids:
+                return Response(status_code=422) # Duplicate
+            receipt_ids.add(r.get("receiptId"))
+                
+            # Verify against stored proposal
+            if did not in stored["proposals"]:
+                return Response(status_code=422)
+                
+            sp = stored["proposals"][did]
+            prop_digest_obj = {
+                "dossierId": sp["dossierId"],
+                "callId": sp["callId"],
+                "action": sp["action"],
+                "target": sp["target"],
+                "payload": sp["payload"],
+                "evidence": sorted(sp["evidence"])
+            }
+            computed_prop_digest = hash_json(prop_digest_obj)
+            
+            if r.get("proposalDigest") != computed_prop_digest or r.get("callId") != sp["callId"]:
+                return Response(status_code=422)
+                
+            outcomes.append({
+                "dossierId": did,
+                "callId": r.get("callId"),
+                "action": r.get("action"),
+                "proposalDigest": r.get("proposalDigest"),
+                "receiptId": r.get("receiptId"),
+                "status": "executed" if r.get("accepted") else "rejected"
+            })
+            
+        return {
+            "profile": "ga5-mailroom-action-gate/v2",
+            "evaluationId": eval_id,
+            "status": "completed",
+            "inputDigest": input_digest,
+            "outcomes": outcomes
+        }
+        
+    return Response(status_code=400)
