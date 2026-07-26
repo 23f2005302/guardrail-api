@@ -266,63 +266,385 @@ async def mcp_endpoint(request: Request):
     if msg_id is not None: return {"jsonrpc": "2.0", "id": msg_id, "error": {"code": -32601, "message": "Method not found"}}
     return {}
 
-
 # =====================================================================
 # QUESTION 6: MAILROOM AGENT (/mailroom)
 # =====================================================================
 
+from fastapi.responses import JSONResponse
+
 EVAL_STATE = {}
 DOSSIER_STATE = {}
 
+PROFILE = "ga5-mailroom-action-gate/v2"
+
+
 def compact_json(obj):
-    return json.dumps(obj, separators=(',', ':'), sort_keys=True)
+    return json.dumps(
+        obj,
+        separators=(",", ":"),
+        sort_keys=True,
+        ensure_ascii=False
+    )
+
 
 def hash_json(obj):
-    return hashlib.sha256(compact_json(obj).encode('utf-8')).hexdigest()
+    return hashlib.sha256(compact_json(obj).encode("utf-8")).hexdigest()
+
+
+def error_response(status_code, code, message):
+    return JSONResponse(
+        status_code=status_code,
+        content={
+            "profile": PROFILE,
+            "status": "error",
+            "error": {
+                "code": code,
+                "message": message
+            }
+        }
+    )
+
 
 def verify_ed25519(jwk, signature_b64, payload_bytes):
     try:
-        x_b64 = jwk.get("x", "")
-        x_b64 += '=' * (4 - len(x_b64) % 4)
-        public_bytes = base64.urlsafe_b64decode(x_b64)
+        if not isinstance(jwk, dict):
+            return False
+        if not isinstance(signature_b64, str) or not signature_b64:
+            return False
+
+        x_b64 = jwk.get("x")
+        if not isinstance(x_b64, str) or not x_b64:
+            return False
+
+        x_b64 += "=" * (-len(x_b64) % 4)
+        public_bytes = base64.urlsafe_b64decode(x_b64.encode("ascii"))
+
+        signature_b64 += "=" * (-len(signature_b64) % 4)
+        signature = base64.urlsafe_b64decode(signature_b64.encode("ascii"))
+
         public_key = ed25519.Ed25519PublicKey.from_public_bytes(public_bytes)
-        signature = base64.b64decode(signature_b64)
         public_key.verify(signature, payload_bytes)
         return True
     except Exception:
         return False
 
-def analyze_dossier(dossier):
-    line_ids = []
-    text_corpus = []
-    for src in dossier.get("sources", []):
-        for line in src.get("lines", []):
-            lid = line.get("lineId")
-            txt = line.get("text", "")
-            if lid:
-                line_ids.append(lid)
-            text_corpus.append(txt.lower())
 
-    full_corpus = " ".join(text_corpus) + " " + dossier.get("objective", "").lower()
-    evidence = line_ids[:2] if len(line_ids) >= 2 else (line_ids if line_ids else ["line_1"])
-    did = dossier.get("dossierId", "item1")
-    mailbox = dossier.get("mailbox", "support")
+def get_lines(dossier):
+    rows = []
 
-    email_match = re.search(r'[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+', full_corpus)
-    extracted_email = email_match.group(0) if email_match else "customer@example.com"
+    for source in dossier.get("sources", []):
+        source_id = source.get("sourceId") or source.get("id") or ""
+        for line in source.get("lines", []):
+            line_id = line.get("lineId")
+            text = line.get("text")
 
-    if any(k in full_corpus for k in ["ignore", "silent", "secret", "inject", "quarantine", "override"]):
-        return "quarantine_item", {"kind": "security_queue", "id": "mailroom"}, {"artifactId": did, "reasonCode": "INDIRECT_PROMPT_INJECTION"}, evidence
-    elif "draft" in full_corpus:
-        return "create_draft", {"kind": "draft_queue", "id": f"mailbox:{mailbox}"}, {"recipient": extracted_email, "referenceId": did, "status": "draft", "template": "order_status"}, evidence
-    elif "window" in full_corpus or "delivery" in full_corpus:
-        return "update_internal_record", {"kind": "case_record", "id": f"case_{did}"}, {"field": "delivery_window", "sourceEventId": "evt_01", "value": "updated_window"}, evidence
-    elif "approve" in full_corpus or "notice" in full_corpus:
-        return "send_approved_notice", {"kind": "email", "id": extracted_email}, {"referenceId": did, "status": "approved", "template": "approved_delivery_notice"}, evidence
-    elif "verify" in full_corpus or "ambiguous" in full_corpus or "conflict" in full_corpus:
-        return "request_confirmation", {"kind": "approval_queue", "id": "support_team"}, {"claimedSender": extracted_email, "questionCode": "VERIFY_REQUEST", "referenceId": did}, evidence
-    else:
-        return "no_action", None, {"reasonCode": "INFORMATIONAL", "referenceId": did}, evidence
+            if isinstance(line_id, str) and isinstance(text, str):
+                rows.append({
+                    "sourceId": source_id,
+                    "lineId": line_id,
+                    "text": text
+                })
+
+    return rows
+
+
+def all_text(rows, dossier):
+    objective = dossier.get("objective", "")
+    parts = [objective] if isinstance(objective, str) else []
+    parts.extend(row["text"] for row in rows)
+    return "\n".join(parts)
+
+
+def find_lines(rows, *patterns):
+    found = []
+
+    for row in rows:
+        text = row["text"].lower()
+        if any(re.search(pattern, text, re.I) for pattern in patterns):
+            found.append(row["lineId"])
+
+    return found
+
+
+def unique_ids(ids):
+    result = []
+    seen = set()
+
+    for value in ids:
+        if isinstance(value, str) and value and value not in seen:
+            seen.add(value)
+            result.append(value)
+
+    return result
+
+
+def evidence_for(rows, *patterns):
+    ids = find_lines(rows, *patterns)
+    return unique_ids(ids)
+
+
+def extract_email(rows):
+    email_pattern = r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b"
+
+    for row in rows:
+        match = re.search(email_pattern, row["text"])
+        if match:
+            return match.group(0).lower(), row["lineId"]
+
+    return None, None
+
+
+def extract_reference_id(dossier, rows):
+    for key in ("referenceId", "caseId", "orderId", "ticketId", "requestId"):
+        value = dossier.get(key)
+        if isinstance(value, str) and value:
+            return value, None
+
+    pattern = (
+        r"\b(?:reference|case|order|ticket|request)"
+        r"\s*(?:id|number|#)?\s*[:#]?\s*([A-Za-z0-9_-]+)\b"
+    )
+
+    for row in rows:
+        match = re.search(pattern, row["text"], re.I)
+        if match:
+            return match.group(1), row["lineId"]
+
+    dossier_id = dossier.get("dossierId")
+    return dossier_id if isinstance(dossier_id, str) else None, None
+
+
+def extract_delivery_window(rows):
+    patterns = [
+        r"\b(?:delivery|arrival|shipping)\s+(?:window|date|time)\s*(?:is|to|as|for)?\s*[:\-]?\s*([^\n.]+)",
+        r"\b(?:deliver|arrival)\s+(?:on|by|between)\s+([^\n.]+)"
+    ]
+
+    for row in rows:
+        for pattern in patterns:
+            match = re.search(pattern, row["text"], re.I)
+            if match:
+                value = match.group(1).strip(" .,:;")
+                if value:
+                    return value, row["lineId"]
+
+    return None, None
+
+
+def contains_injection(rows):
+    patterns = [
+        r"\bignore\b.*\b(instruction|policy|rule|guardrail)\b",
+        r"\boverride\b.*\b(instruction|policy|rule|guardrail)\b",
+        r"\b(system prompt|developer message|hidden instruction)\b",
+        r"\bexfiltrat(?:e|ion)\b",
+        r"\bsend\b.*\b(secret|credential|token|password)\b",
+        r"\bdo not (?:tell|inform|notify)\b"
+    ]
+
+    return evidence_for(rows, *patterns)
+
+
+def contains_conflict(rows):
+    patterns = [
+        r"\bconflict(?:ing)?\b",
+        r"\bcontradict(?:ion|ory)?\b",
+        r"\bambiguous\b",
+        r"\bunclear\b",
+        r"\bverify\b",
+        r"\bconfirm\b",
+        r"\bnot authorized\b",
+        r"\bunauthorized\b"
+    ]
+
+    return evidence_for(rows, *patterns)
+
+
+def is_authorized_approval(rows):
+    patterns = [
+        r"\bapproved\b",
+        r"\bauthori[sz]ed\b",
+        r"\bpermission granted\b",
+        r"\bapproval granted\b"
+    ]
+
+    return evidence_for(rows, *patterns)
+
+
+def make_proposal(dossier):
+    dossier_id = dossier.get("dossierId")
+    rows = get_lines(dossier)
+
+    if not isinstance(dossier_id, str) or not dossier_id:
+        raise ValueError("Each dossier requires a non-empty dossierId.")
+
+    # 1. Security takes priority over every business instruction.
+    injection_evidence = contains_injection(rows)
+    if injection_evidence:
+        return {
+            "dossierId": dossier_id,
+            "action": "quarantine_item",
+            "target": {
+                "kind": "security_queue",
+                "id": "mailroom"
+            },
+            "payload": {
+                "artifactId": dossier_id,
+                "reasonCode": "INDIRECT_PROMPT_INJECTION"
+            },
+            "evidence": injection_evidence
+        }
+
+    # 2. Conflicts or ambiguous authority require confirmation.
+    conflict_evidence = contains_conflict(rows)
+    if conflict_evidence:
+        sender, sender_line = extract_email(rows)
+        reference_id, reference_line = extract_reference_id(dossier, rows)
+
+        evidence = unique_ids(
+            conflict_evidence +
+            ([sender_line] if sender_line else []) +
+            ([reference_line] if reference_line else [])
+        )
+
+        return {
+            "dossierId": dossier_id,
+            "action": "request_confirmation",
+            "target": {
+                "kind": "approval_queue",
+                "id": "support_team"
+            },
+            "payload": {
+                "claimedSender": sender,
+                "questionCode": "VERIFY_REQUEST",
+                "referenceId": reference_id
+            },
+            "evidence": evidence
+        }
+
+    # 3. Only send an external notice with explicit approval/authority.
+    approval_evidence = is_authorized_approval(rows)
+    if approval_evidence:
+        recipient, recipient_line = extract_email(rows)
+        reference_id, reference_line = extract_reference_id(dossier, rows)
+
+        if recipient and reference_id:
+            evidence = unique_ids(
+                approval_evidence +
+                [recipient_line] +
+                ([reference_line] if reference_line else [])
+            )
+
+            return {
+                "dossierId": dossier_id,
+                "action": "send_approved_notice",
+                "target": {
+                    "kind": "email",
+                    "id": recipient
+                },
+                "payload": {
+                    "referenceId": reference_id,
+                    "status": "approved",
+                    "template": "approved_delivery_notice"
+                },
+                "evidence": evidence
+            }
+
+    # 4. Internal delivery update requires an actual stated delivery value.
+    delivery_window, delivery_line = extract_delivery_window(rows)
+    reference_id, reference_line = extract_reference_id(dossier, rows)
+
+    if delivery_window and reference_id:
+        evidence = unique_ids(
+            [delivery_line] +
+            ([reference_line] if reference_line else [])
+        )
+
+        return {
+            "dossierId": dossier_id,
+            "action": "update_internal_record",
+            "target": {
+                "kind": "case_record",
+                "id": reference_id
+            },
+            "payload": {
+                "field": "delivery_window",
+                "value": delivery_window
+            },
+            "evidence": evidence
+        }
+
+    # 5. Drafts are non-executing and require a real recipient.
+    draft_evidence = evidence_for(rows, r"\bdraft\b", r"\bprepare\b.*\bemail\b")
+    if draft_evidence:
+        recipient, recipient_line = extract_email(rows)
+        reference_id, reference_line = extract_reference_id(dossier, rows)
+
+        if recipient and reference_id:
+            evidence = unique_ids(
+                draft_evidence +
+                [recipient_line] +
+                ([reference_line] if reference_line else [])
+            )
+
+            mailbox = dossier.get("mailbox", "support")
+            mailbox = mailbox if isinstance(mailbox, str) and mailbox else "support"
+
+            return {
+                "dossierId": dossier_id,
+                "action": "create_draft",
+                "target": {
+                    "kind": "draft_queue",
+                    "id": f"mailbox:{mailbox}"
+                },
+                "payload": {
+                    "recipient": recipient,
+                    "referenceId": reference_id,
+                    "status": "draft",
+                    "template": "order_status"
+                },
+                "evidence": evidence
+            }
+
+    # 6. Do not manufacture a target, recipient, event ID, or evidence.
+    return {
+        "dossierId": dossier_id,
+        "action": "no_action",
+        "target": None,
+        "payload": {
+            "reasonCode": "INSUFFICIENT_AUTHORITY_OR_EVIDENCE",
+            "referenceId": reference_id
+        },
+        "evidence": []
+    }
+
+
+def proposal_digest(proposal):
+    digest_obj = {
+        "dossierId": proposal["dossierId"],
+        "callId": proposal["callId"],
+        "action": proposal["action"],
+        "target": proposal["target"],
+        "payload": proposal["payload"],
+        "evidence": sorted(proposal["evidence"])
+    }
+    return hash_json(digest_obj)
+
+
+def receipt_signing_payload(evaluation_id, input_digest, receipt):
+    return {
+        "profile": PROFILE,
+        "evaluationId": evaluation_id,
+        "inputDigest": input_digest,
+        "receipt": {
+            "dossierId": receipt.get("dossierId"),
+            "callId": receipt.get("callId"),
+            "action": receipt.get("action"),
+            "accepted": receipt.get("accepted"),
+            "proposalDigest": receipt.get("proposalDigest"),
+            "receiptId": receipt.get("receiptId")
+        }
+    }
+
 
 @app.post("/")
 @app.post("/mailroom")
@@ -330,137 +652,252 @@ def analyze_dossier(dossier):
 async def mailroom_endpoint(request: Request):
     try:
         body_bytes = await request.body()
-        data = json.loads(body_bytes.decode('utf-8'))
+        data = json.loads(body_bytes.decode("utf-8"))
     except Exception:
-        return Response(status_code=400)
-        
-    op = data.get("operation")
-    eval_id = data.get("evaluationId")
+        return error_response(400, "INVALID_JSON", "Request body must be valid JSON.")
 
-    if op == "propose":
-        if not eval_id or "dossiers" not in data:
-            return Response(status_code=422)
+    if not isinstance(data, dict):
+        return error_response(422, "INVALID_REQUEST", "Request body must be an object.")
 
-        input_digest = hash_json(data.get("dossiers"))
-        
-        # Conflict check: same evaluationId with different inputDigest must return 409
-        if eval_id in EVAL_STATE:
-            if EVAL_STATE[eval_id]["inputDigest"] != input_digest:
-                return Response(status_code=409)
-            else:
-                return EVAL_STATE[eval_id]["response"]
+    operation = data.get("operation")
+    evaluation_id = data.get("evaluationId")
+
+    if not isinstance(evaluation_id, str) or not evaluation_id:
+        return error_response(422, "INVALID_REQUEST", "evaluationId is required.")
+
+    if operation == "propose":
+        dossiers = data.get("dossiers")
+        verifier = data.get("receiptVerifier")
+
+        if not isinstance(dossiers, list):
+            return error_response(422, "INVALID_REQUEST", "dossiers must be an array.")
+
+        if not isinstance(verifier, dict) or not isinstance(verifier.get("publicKeyJwk"), dict):
+            return error_response(
+                422,
+                "INVALID_REQUEST",
+                "receiptVerifier.publicKeyJwk is required."
+            )
+
+        dossier_ids = []
+        for dossier in dossiers:
+            if not isinstance(dossier, dict):
+                return error_response(422, "INVALID_REQUEST", "Every dossier must be an object.")
+
+            dossier_id = dossier.get("dossierId")
+            if not isinstance(dossier_id, str) or not dossier_id:
+                return error_response(422, "INVALID_REQUEST", "Every dossier requires dossierId.")
+
+            dossier_ids.append(dossier_id)
+
+        if len(dossier_ids) != len(set(dossier_ids)):
+            return error_response(422, "INVALID_REQUEST", "dossierId values must be unique.")
+
+        input_digest = hash_json(dossiers)
+
+        # Exact replay must return the exact stored response.
+        if evaluation_id in EVAL_STATE:
+            saved = EVAL_STATE[evaluation_id]
+
+            if saved["inputDigest"] != input_digest:
+                return error_response(
+                    409,
+                    "EVALUATION_CONFLICT",
+                    "evaluationId was already used with different dossiers."
+                )
+
+            return JSONResponse(content=saved["proposalResponse"])
 
         proposals = []
-        for d in data.get("dossiers", []):
-            did = d.get("dossierId")
-            content_hash = hash_json(d)
-            
-            if did in DOSSIER_STATE and DOSSIER_STATE[did]["hash"] == content_hash:
-                proposals.append(DOSSIER_STATE[did]["proposal"])
-                continue
+        seen_call_ids = set()
 
-            action, target, payload, evidence = analyze_dossier(d)
-            call_id = "call_" + str(uuid.uuid4()).replace("-", "")[:20]
-            
+        for dossier in dossiers:
+            dossier_id = dossier["dossierId"]
+            content_digest = hash_json(dossier)
+
+            try:
+                base_proposal = make_proposal(dossier)
+            except ValueError as exc:
+                return error_response(422, "INVALID_REQUEST", str(exc))
+
+            # A dossier may be reused only if its content and proposed decision
+            # are exactly stable. Otherwise reject the cross-evaluation conflict.
+            previous = DOSSIER_STATE.get(dossier_id)
+            if previous:
+                if previous["contentDigest"] != content_digest:
+                    return error_response(
+                        409,
+                        "DOSSIER_CONFLICT",
+                        f"dossierId '{dossier_id}' was previously submitted with different content."
+                    )
+
+                previous_base = previous["baseProposal"]
+                if (
+                    previous_base["action"] != base_proposal["action"] or
+                    previous_base["target"] != base_proposal["target"] or
+                    previous_base["payload"] != base_proposal["payload"]
+                ):
+                    return error_response(
+                        409,
+                        "DOSSIER_CONFLICT",
+                        f"dossierId '{dossier_id}' has a conflicting proposed action."
+                    )
+
+            call_id = f"call_{uuid.uuid4().hex}"
+            while call_id in seen_call_ids:
+                call_id = f"call_{uuid.uuid4().hex}"
+
+            seen_call_ids.add(call_id)
+
             proposal = {
-                "dossierId": did,
+                "dossierId": dossier_id,
                 "callId": call_id,
-                "action": action,
-                "target": target,
-                "payload": payload,
-                "evidence": evidence
+                "action": base_proposal["action"],
+                "target": base_proposal["target"],
+                "payload": base_proposal["payload"],
+                "evidence": base_proposal["evidence"]
             }
             proposals.append(proposal)
-            DOSSIER_STATE[did] = {"hash": content_hash, "proposal": proposal}
 
-        resp = {
-            "profile": "ga5-mailroom-action-gate/v2",
-            "evaluationId": eval_id,
+            DOSSIER_STATE[dossier_id] = {
+                "contentDigest": content_digest,
+                "baseProposal": base_proposal
+            }
+
+        response_body = {
+            "profile": PROFILE,
+            "evaluationId": evaluation_id,
             "status": "awaiting_receipts",
             "inputDigest": input_digest,
             "proposals": proposals
         }
-        
-        EVAL_STATE[eval_id] = {
-            "inputDigest": input_digest,
-            "verifier": data.get("receiptVerifier"),
-            "proposals": {p["dossierId"]: p for p in proposals},
-            "response": resp
-        }
-        return resp
 
-    elif op == "commit":
+        EVAL_STATE[evaluation_id] = {
+            "inputDigest": input_digest,
+            "verifier": verifier,
+            "proposals": {proposal["dossierId"]: proposal for proposal in proposals},
+            "proposalResponse": response_body,
+            "commitResponse": None
+        }
+
+        return JSONResponse(content=response_body)
+
+    if operation == "commit":
+        if evaluation_id not in EVAL_STATE:
+            return error_response(
+                409,
+                "UNKNOWN_EVALUATION",
+                "No matching proposal exists for evaluationId."
+            )
+
+        stored = EVAL_STATE[evaluation_id]
         input_digest = data.get("inputDigest")
-        if not eval_id or eval_id not in EVAL_STATE:
-            return Response(status_code=400)
-            
-        stored = EVAL_STATE[eval_id]
-        if stored["inputDigest"] != input_digest:
-            return Response(status_code=409)
-            
+        receipts = data.get("receipts")
+
+        if input_digest != stored["inputDigest"]:
+            return error_response(
+                409,
+                "INPUT_DIGEST_MISMATCH",
+                "inputDigest does not match the proposal."
+            )
+
+        if not isinstance(receipts, list):
+            return error_response(422, "INVALID_REQUEST", "receipts must be an array.")
+
+        # Commit replay returns exactly the original completion response.
+        if stored["commitResponse"] is not None:
+            return JSONResponse(content=stored["commitResponse"])
+
+        expected = stored["proposals"]
+
+        # One receipt per proposal: no missing, duplicate, or unknown receipt.
+        if len(receipts) != len(expected):
+            return error_response(
+                422,
+                "INVALID_RECEIPTS",
+                "Exactly one receipt is required for each proposal."
+            )
+
+        receipt_ids = set()
+        dossier_ids = set()
+        outcomes = []
+
         verifier = stored["verifier"]
         jwk = verifier.get("publicKeyJwk")
-        
-        outcomes = []
-        receipt_ids = set()
 
-        for r in data.get("receipts", []):
-            did = r.get("dossierId")
-            
-            verify_obj = {
-                "profile": "ga5-mailroom-action-gate/v2",
-                "evaluationId": eval_id,
-                "inputDigest": input_digest,
-                "receipt": {
-                    "dossierId": did,
-                    "callId": r.get("callId"),
-                    "action": r.get("action"),
-                    "accepted": r.get("accepted"),
-                    "proposalDigest": r.get("proposalDigest"),
-                    "receiptId": r.get("receiptId")
-                }
-            }
-            
-            payload_bytes = compact_json(verify_obj).encode('utf-8')
-            if not verify_ed25519(jwk, r.get("receiptSignature", ""), payload_bytes):
-                return Response(status_code=422)
-                
-            if r.get("receiptId") in receipt_ids:
-                return Response(status_code=422)
-            receipt_ids.add(r.get("receiptId"))
-                
-            if did not in stored["proposals"]:
-                return Response(status_code=422)
-                
-            sp = stored["proposals"][did]
-            prop_digest_obj = {
-                "dossierId": sp["dossierId"],
-                "callId": sp["callId"],
-                "action": sp["action"],
-                "target": sp["target"],
-                "payload": sp["payload"],
-                "evidence": sorted(sp["evidence"])
-            }
-            computed_prop_digest = hash_json(prop_digest_obj)
-            
-            if r.get("proposalDigest") != computed_prop_digest or r.get("callId") != sp["callId"]:
-                return Response(status_code=422)
-                
+        for receipt in receipts:
+            if not isinstance(receipt, dict):
+                return error_response(422, "INVALID_RECEIPT", "Each receipt must be an object.")
+
+            dossier_id = receipt.get("dossierId")
+            receipt_id = receipt.get("receiptId")
+
+            if not isinstance(dossier_id, str) or dossier_id not in expected:
+                return error_response(422, "INVALID_RECEIPT", "Receipt has an unknown dossierId.")
+
+            if dossier_id in dossier_ids:
+                return error_response(422, "INVALID_RECEIPT", "Duplicate dossier receipt.")
+
+            if not isinstance(receipt_id, str) or not receipt_id or receipt_id in receipt_ids:
+                return error_response(422, "INVALID_RECEIPT", "receiptId must be unique.")
+
+            dossier_ids.add(dossier_id)
+            receipt_ids.add(receipt_id)
+
+            proposal = expected[dossier_id]
+
+            if receipt.get("callId") != proposal["callId"]:
+                return error_response(422, "INVALID_RECEIPT", "callId does not match proposal.")
+
+            if receipt.get("action") != proposal["action"]:
+                return error_response(422, "INVALID_RECEIPT", "action does not match proposal.")
+
+            expected_digest = proposal_digest(proposal)
+            if receipt.get("proposalDigest") != expected_digest:
+                return error_response(422, "INVALID_RECEIPT", "proposalDigest does not match proposal.")
+
+            if not isinstance(receipt.get("accepted"), bool):
+                return error_response(422, "INVALID_RECEIPT", "accepted must be boolean.")
+
+            signing_payload = receipt_signing_payload(
+                evaluation_id,
+                input_digest,
+                receipt
+            )
+
+            signature = receipt.get("receiptSignature", "")
+            if not verify_ed25519(
+                jwk,
+                signature,
+                compact_json(signing_payload).encode("utf-8")
+            ):
+                return error_response(422, "INVALID_RECEIPT", "Invalid receipt signature.")
+
             outcomes.append({
-                "dossierId": did,
-                "callId": r.get("callId"),
-                "action": sp["action"],
-                "proposalDigest": r.get("proposalDigest"),
-                "receiptId": r.get("receiptId"),
-                "status": "executed" if r.get("accepted") else "rejected"
+                "dossierId": dossier_id,
+                "callId": proposal["callId"],
+                "action": proposal["action"],
+                "proposalDigest": expected_digest,
+                "receiptId": receipt_id,
+                "status": "executed" if receipt["accepted"] else "rejected"
             })
-            
-        return {
-            "profile": "ga5-mailroom-action-gate/v2",
-            "evaluationId": eval_id,
+
+        if dossier_ids != set(expected.keys()):
+            return error_response(
+                422,
+                "INVALID_RECEIPTS",
+                "Receipts do not cover every proposal."
+            )
+
+        response_body = {
+            "profile": PROFILE,
+            "evaluationId": evaluation_id,
             "status": "completed",
             "inputDigest": input_digest,
             "outcomes": outcomes
         }
-        
-    return Response(status_code=400)
+
+        stored["commitResponse"] = response_body
+        return JSONResponse(content=response_body)
+
+    return error_response(400, "INVALID_OPERATION", "operation must be propose or commit.")
